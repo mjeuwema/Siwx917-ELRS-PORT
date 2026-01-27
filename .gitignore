@@ -1,0 +1,52 @@
+# Build artifacts
+cmake_gcc/build/
+cmake_gcc/CMakeCache.txt
+cmake_gcc/CMakeFiles/
+cmake_iar/build/
+cmake_iar/CMakeCache.txt
+cmake_iar/CMakeFiles/
+
+# IDE files
+*.code-workspace
+.vscode/
+.settings/
+.project
+.cproject
+
+# Logs and temp files
+*.log
+serial_log.txt
+lr1121_firmware_check.txt
+
+# Python debug/analysis scripts
+*.py
+*.pyc
+__pycache__/
+
+# Upstream reference files (not needed for build)
+*_upstream.cpp
+*_upstream.h
+elrs_4_0_*.txt
+
+# Other reference/temp files
+*.zip
+wifi_http_otaf_soc/
+
+# Binary outputs (use releases instead)
+*.rps
+*.hex
+*.bin
+*.elf
+*.map
+*.axf
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup files
+*_backup.c
+*_backup.h
+*.bak
+*.orig

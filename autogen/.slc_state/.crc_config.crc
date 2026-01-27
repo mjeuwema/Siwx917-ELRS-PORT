@@ -1,0 +1,8 @@
+#CRC Codes for initially generated config files -- do not modify!
+nvm3_default_config.h=1021693449
+sl_si91x_gspi_config.h=1580588078
+sl_si91x_ulp_timer_common_config.h=1050272464
+sl_si91x_ulp_timer_init_timer0_config.h=-416505136
+sl_si91x_usart_common_config.h=777684978
+sl_si91x_usart_config.h=937876655
+sl_si91x_watchdog_timer_config.h=-213957819

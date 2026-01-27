@@ -1,0 +1,117 @@
+# Silicon Labs Project Configuration Tools: slcp, v0, Component selection file.
+project_name: wifi_gspi_merged
+label: wifi_gspi_merged
+description: |
+  Wi-Fi Access Point with GSPI/LR1121 radio support for ELRS
+category: Example|Wi-Fi
+filter:
+- name: Project Difficulty
+  value: [Advanced]
+- name: Wireless Technology
+  value: [Wi-Fi]
+package: wifi
+quality: production
+readme:
+- {path: readme.md}
+source:
+- {path: app.c}
+- {path: src/gspi_example.c}
+- {path: src/lr1121_driver.c}
+- {path: src/lr1121_standalone_test.c}
+- {path: src/lr1121_dio1_test.c}
+- {path: src/lr1121_hw_test.c}
+- {path: src/wifi_http_test.c}
+- {path: src/external_tcxo_test.c}
+- {path: src/tcxo_diagnostic.c}
+- {path: src/busy_monitor_test.c}
+- {path: src/lr1121_elrs_init.c}
+- {path: src/elrs_protocol/crc.c}
+- {path: src/elrs_protocol/random.c}
+- {path: src/elrs_protocol/fhss.c}
+- {path: src/elrs_protocol/ota.c}
+- {path: src/elrs_protocol/elrs_globals.c}
+- {path: src/elrs_protocol/lr1121_hal.c}
+- {path: src/elrs_protocol/elrs_rx.c}
+- {path: src/elrs_protocol/hw_timer.c}
+- {path: src/elrs_protocol/pfd.c}
+- {path: src/elrs_protocol/lq_calc.c}
+- {path: src/elrs_protocol/lpf.c}
+- {path: src/elrs_protocol/elrs_main.c}
+- {path: src/elrs_protocol/crsf.c}
+- {path: src/elrs_protocol/md5.c}
+include:
+- path: .
+  file_list:
+  - {path: app.h}
+- path: src
+  file_list:
+  - {path: gspi_example.h}
+  - {path: lr1121_driver.h}
+  - {path: lr1121_standalone_test.h}
+  - {path: lr1121_dio1_test.h}
+  - {path: lr1121_hw_test.h}
+  - {path: wifi_http_test.h}
+  - {path: external_tcxo_test.h}
+  - {path: tcxo_diagnostic.h}
+  - {path: busy_monitor_test.h}
+  - {path: lr1121_elrs_init.h}
+- path: src/elrs_protocol
+  file_list:
+  - {path: elrs_platform.h}
+  - {path: crc.h}
+  - {path: random.h}
+  - {path: fhss.h}
+  - {path: crsf_protocol.h}
+  - {path: telemetry_protocol.h}
+  - {path: ota.h}
+  - {path: elrs_globals.h}
+  - {path: elrs_protocol.h}
+  - {path: lr1121_hal.h}
+  - {path: elrs_rx.h}
+  - {path: hw_timer.h}
+  - {path: pfd.h}
+  - {path: lq_calc.h}
+  - {path: lpf.h}
+  - {path: elrs_main.h}
+  - {path: crsf.h}
+  - {path: md5.h}
+sdk: {vendor: null, id: simplicity_sdk, version: 2025.6.2}
+toolchain_settings:
+- {value: -Wall -Werror, option: gcc_compiler_option}
+component:
+- {from: wiseconnect3_sdk, id: SIWG917Y111MGABA}
+- {from: wiseconnect3_sdk, id: basic_network_config_manager}
+- {from: wiseconnect3_sdk, id: brd2708a}
+- {from: wiseconnect3_sdk, id: si91x_memory_default_config}
+- {from: wiseconnect3_sdk, id: sl_gspi}
+- {from: wiseconnect3_sdk, id: sl_http_server}
+- {from: wiseconnect3_sdk, id: sl_si91x_internal_stack}
+- {from: wiseconnect3_sdk, id: sl_si91x_mem_pool_buffers_with_quota}
+- {from: wiseconnect3_sdk, id: sl_si91x_nvm3}
+
+- {from: wiseconnect3_sdk, id: sl_watchdog_timer}
+- {from: wiseconnect3_sdk, id: syscalls}
+- instance: [timer0]
+  from: wiseconnect3_sdk
+  id: ulp_timers_instance
+- {from: wiseconnect3_sdk, id: wifi}
+- {from: wiseconnect3_sdk, id: wifi_resources}
+- {from: wiseconnect3_sdk, id: wiseconnect3_common}
+- {id: freertos}
+- {id: freertos_heap_4}
+- {id: sl_main}
+other_file:
+- {path: resources/readme/access_point_output.png}
+- {path: resources/readme/setup_soc_ncp.png}
+define:
+- {name: SL_SI91X_PRINT_DBG_LOG}
+configuration:
+- {name: SL_BOARD_ENABLE_VCOM, value: '1'}
+ui_hints:
+  highlight:
+  - {path: readme.md, focus: true}
+sdk_extension:
+- {vendor: null, id: wiseconnect3_sdk, version: 3.5.2}
+post_build:
+- {path: wifi_gspi_merged.slpb}
+
