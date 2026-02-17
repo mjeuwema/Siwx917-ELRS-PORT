@@ -39,6 +39,10 @@
 #include "sl_si91x_gspi.h"
 #include "core_cm4.h"  /* For __DSB() memory barrier */
 
+/* SDK GPIO driver for UULP GPIO interrupt support */
+#include "sl_si91x_driver_gpio.h"
+#include "sl_gpio_board.h"
+
 /* SL_STATUS_EMPTY may not be defined in older SDK versions
  * It's used by GSPI when DMA completes but FIFO appears empty
  */
@@ -54,6 +58,7 @@
 // #define USE_SOFT_SPI
 
 #include <string.h>
+#include <stdbool.h>
 
 /* Soft SPI function removed - Logic inlined in spi_transfer */
 
@@ -2271,80 +2276,108 @@ int lr1121_end_update(void) {
 }
 
 /*******************************************************************************
- * DIO1 INTERRUPT SUPPORT
+ * DIO1 INTERRUPT SUPPORT using HP GPIO Pin Interrupt
  * 
- * Citation: siw917x-family-rm.pdf Section 11.10 "UULP GPIO Interrupts"
- * DIO1 is connected to UULP_VBAT_GPIO_2 on BRD2708A
+ * DIO1 is connected to GPIO_6 (HP domain) for reliable interrupt handling.
+ * Uses standard HP GPIO pin interrupt - simpler and more reliable than UULP.
+ * 
+ * HARDWARE WIRING: Connect LR1121 DIO1 to GPIO_6 on the SiW917.
+ * 
+ * HP GPIO Pin Interrupts:
+ *   - 8 independent pin interrupt channels (0-7)
+ *   - Each channel can be assigned to any HP GPIO pin
+ *   - Rising/falling edge or level triggered
+ *   - IRQ52 (EGPIO_PIN_0_IRQn) through IRQ59 (EGPIO_PIN_7_IRQn)
  ******************************************************************************/
 
-/* UULP GPIO Base Address */
-#define UULP_GPIO_INTR_BASE   0x12080000UL
+/* DIO1 pin configuration - GPIO_46 (HP domain, available on breakout pad)
+ * 
+ * HP GPIO Port mapping:
+ *   SL_GPIO_PORT_A = GPIO 0-15
+ *   SL_GPIO_PORT_B = GPIO 16-31
+ *   SL_GPIO_PORT_C = GPIO 32-47
+ *   SL_GPIO_PORT_D = GPIO 48-63
+ * 
+ * GPIO_46 is on Port C (32-47), pin number within port = 46-32 = 14
+ */
+#define DIO1_HP_GPIO        46
+#define DIO1_HP_PORT        SL_GPIO_PORT_C   /* Port C for GPIO 32-47 */
+#define DIO1_HP_PIN         (DIO1_HP_GPIO - 32)  /* Pin 14 within Port C */
+#define DIO1_INT_CHANNEL    0       /* Use pin interrupt channel 0 */
 
-/* UULP_VBAT_GPIO_2 Configuration Register (for DIO1 input) */
-#define UULP_VBAT_GPIO2_CONFIG_REG  (*(volatile uint32_t *)(0x24048620UL))
-
-/* UULP GPIO Interrupt Configuration and Status Registers */
-#define UULP_GPIO_CONFIG_REG  (*(volatile uint32_t *)(UULP_GPIO_INTR_BASE + 0x010))
-#define UULP_GPIO_STATUS_REG  (*(volatile uint32_t *)(UULP_GPIO_INTR_BASE + 0x014))
-
-/* Interrupt enable bits for UULP_VBAT_GPIO_2 */
-#define UULP_GPIO2_RE_EN_BIT  (1UL << 2)   /* Rising Edge Enable */
-#define UULP_GPIO2_FE_EN_BIT  (1UL << 10)  /* Falling Edge Enable */
-#define UULP_GPIO2_LL_EN_BIT  (1UL << 18)  /* Level Low Enable */
-#define UULP_GPIO2_HL_EN_BIT  (1UL << 27)  /* Level High Enable */
-
-/* UULP GPIO Config Register bits */
-#define UULP_GPIO_MODE_MASK       0x07UL
-#define UULP_GPIO_MODE_GPIO       0x00UL
-#define UULP_GPIO_DIRECTION_BIT   (1UL << 7)  /* 0=Output, 1=Input */
-#define UULP_GPIO_REN_BIT         (1UL << 4)  /* Receiver Enable */
+/* Static pin config - needed for SDK calls */
+static sl_si91x_gpio_pin_config_t dio1_pin_config;
 
 /* Static callback storage */
 static lr1121_dio1_callback_t dio1_callback = NULL;
+static bool dio1_initialized = false;
+static volatile bool dio1_callback_enabled = false;  /* Don't call callback until system ready */
+static volatile uint32_t dio1_isr_count = 0;  /* Debug: count ISR entries */
+
+/* Forward declaration of SDK callback */
+static void dio1_gpio_interrupt_callback(uint32_t pin_intr);
 
 /**
- * @brief Initialize DIO1 interrupt support
+ * @brief Initialize DIO1 interrupt support using HP GPIO pin interrupt
+ * 
+ * Uses GPIO_46 with HP GPIO pin interrupt channel 0.
+ * Pure SDK implementation - no direct register access.
  */
 lr1121_status_t lr1121_dio1_init(void)
 {
-  DEBUGOUT("LR1121: Initializing DIO1 interrupt (UULP_VBAT_GPIO_2)...\n");
+  sl_status_t status;
   
-  /* Step 1: Configure UULP_VBAT_GPIO_2 as GPIO input */
-  uint32_t gpio_config = UULP_VBAT_GPIO2_CONFIG_REG;
+  DEBUGOUT("LR1121: Initializing DIO1 interrupt on GPIO_%d (HP domain, SDK)...\n", DIO1_HP_GPIO);
   
-  gpio_config &= ~UULP_GPIO_MODE_MASK;
-  gpio_config |= UULP_GPIO_MODE_GPIO;
-  gpio_config |= UULP_GPIO_DIRECTION_BIT;  /* Input */
-  gpio_config |= UULP_GPIO_REN_BIT;        /* Receiver enable */
+  /* Step 1: Initialize GPIO driver */
+  status = sl_gpio_driver_init();
+  if (status != SL_STATUS_OK && status != SL_STATUS_ALREADY_INITIALIZED) {
+    DEBUGOUT("  sl_gpio_driver_init failed: 0x%04lX\n", (unsigned long)status);
+    return LR1121_ERROR_GPIO_INIT;
+  }
+  DEBUGOUT("  GPIO driver initialized\n");
   
-  UULP_VBAT_GPIO2_CONFIG_REG = gpio_config;
+  /* Step 2: Configure GPIO_46 as input using SDK */
+  dio1_pin_config.port_pin.port = DIO1_HP_PORT;
+  dio1_pin_config.port_pin.pin = DIO1_HP_PIN;
+  dio1_pin_config.direction = GPIO_INPUT;
   
-  /* Wait for configuration to settle */
-  for (volatile int i = 0; i < 100; i++) { }
+  status = sl_gpio_set_configuration(dio1_pin_config);
+  if (status != SL_STATUS_OK) {
+    DEBUGOUT("  sl_gpio_set_configuration failed: 0x%04lX\n", (unsigned long)status);
+    return LR1121_ERROR_GPIO_INIT;
+  }
+  DEBUGOUT("  GPIO_%d configured as input (Port %d, Pin %d)\n", 
+           DIO1_HP_GPIO, DIO1_HP_PORT, DIO1_HP_PIN);
   
-  DEBUGOUT("  UULP_VBAT_GPIO2_CONFIG_REG = 0x%08lX\n", 
-           (unsigned long)UULP_VBAT_GPIO2_CONFIG_REG);
+  /* Step 3: Set pin direction explicitly using SDK */
+  status = sl_si91x_gpio_driver_set_pin_direction(DIO1_HP_PORT, DIO1_HP_PIN, 
+                                                   (sl_si91x_gpio_direction_t)GPIO_INPUT);
+  if (status != SL_STATUS_OK) {
+    DEBUGOUT("  sl_si91x_gpio_driver_set_pin_direction failed: 0x%04lX\n", (unsigned long)status);
+    return LR1121_ERROR_GPIO_INIT;
+  }
+  DEBUGOUT("  Pin direction set to INPUT\n");
   
-  /* Step 2: Configure rising-edge interrupt for DIO1 */
-  uint32_t intr_config = UULP_GPIO_CONFIG_REG;
+  /* Step 4: Configure rising-edge interrupt using SDK
+   * 
+   * Note: Using rising-edge (not level-high) because:
+   * - LR1121 holds DIO1 HIGH until IRQ flags are read
+   * - Level-high would cause infinite ISR loop
+   * - Rising-edge fires once per LOW→HIGH transition
+   */
+  status = sl_gpio_driver_configure_interrupt(&dio1_pin_config.port_pin,
+                                              DIO1_INT_CHANNEL,
+                                              (sl_gpio_interrupt_flag_t)SL_GPIO_INTERRUPT_RISE_EDGE,
+                                              (sl_gpio_irq_callback_t)&dio1_gpio_interrupt_callback,
+                                              (uint32_t *)NULL);
+  if (status != SL_STATUS_OK) {
+    DEBUGOUT("  sl_gpio_driver_configure_interrupt failed: 0x%04lX\n", (unsigned long)status);
+    return LR1121_ERROR_GPIO_INIT;
+  }
+  DEBUGOUT("  Rising-edge interrupt configured on channel %d\n", DIO1_INT_CHANNEL);
   
-  /* Clear existing interrupt enables for GPIO_2 */
-  intr_config &= ~(UULP_GPIO2_RE_EN_BIT | UULP_GPIO2_FE_EN_BIT | 
-                   UULP_GPIO2_LL_EN_BIT | UULP_GPIO2_HL_EN_BIT);
-  
-  /* Enable rising-edge interrupt */
-  intr_config |= UULP_GPIO2_RE_EN_BIT;
-  
-  UULP_GPIO_CONFIG_REG = intr_config;
-  
-  /* Wait for configuration to settle */
-  for (volatile int i = 0; i < 100; i++) { }
-  
-  DEBUGOUT("  UULP_GPIO_CONFIG_REG = 0x%08lX\n", 
-           (unsigned long)UULP_GPIO_CONFIG_REG);
-  
-  /* Step 3: Clear any pending interrupt status */
-  UULP_GPIO_STATUS_REG = 0xFFFFFFFFUL;
+  dio1_initialized = true;
   
   DEBUGOUT("LR1121: DIO1 interrupt initialized (currently %s)\n",
            lr1121_dio1_read() ? "HIGH" : "LOW");
@@ -2353,45 +2386,59 @@ lr1121_status_t lr1121_dio1_init(void)
 }
 
 /**
- * @brief Enable DIO1 interrupt in NVIC
+ * @brief Enable DIO1 interrupt and allow callbacks
+ * 
+ * This should be called AFTER the LR1121 is initialized and its IRQs cleared.
+ * At that point, DIO1 should be LOW, and subsequent IRQs will trigger rising edges.
  */
-void lr1121_dio1_enable(void) {
-  #define UULP_GPIO_IRQn 5
+void lr1121_dio1_enable(void)
+{
+  if (!dio1_initialized) {
+    DEBUGOUT("LR1121: DIO1 not initialized, call lr1121_dio1_init() first\n");
+    return;
+  }
   
-  /* Enable UULP GPIO interrupt in NVIC */
-  NVIC_EnableIRQ((IRQn_Type)UULP_GPIO_IRQn);
-  NVIC_SetPriority((IRQn_Type)UULP_GPIO_IRQn, 5);
+  /* Clear any pending interrupt first */
+  sl_gpio_driver_clear_interrupts(1 << DIO1_INT_CHANNEL);
   
-  /* Unmask UULP GPIO interrupt (bit 2 for UULP_VBAT_GPIO_2) */
-  volatile uint32_t *uulp_intr_mask_clr = (volatile uint32_t *)0x12080004;
-  *uulp_intr_mask_clr = (1 << 2);
+  /* Enable the pin interrupt */
+  uint32_t irqn = EGPIO_PIN_0_IRQn + DIO1_INT_CHANNEL;
+  NVIC_EnableIRQ((IRQn_Type)irqn);
   
-  DEBUGOUT("LR1121: DIO1 interrupt enabled (IRQn=%d)\n", UULP_GPIO_IRQn);
+  /* Now allow callbacks to be invoked */
+  dio1_callback_enabled = true;
+  
+  DEBUGOUT("LR1121: DIO1 interrupt enabled on GPIO_%d\n", DIO1_HP_PIN);
 }
 
 /**
- * @brief Disable DIO1 interrupt in NVIC
+ * @brief Disable DIO1 interrupt
  */
 void lr1121_dio1_disable(void)
 {
-  #define UULP_GPIO_IRQn 5
+  if (!dio1_initialized) {
+    return;
+  }
   
-  /* Disable UULP GPIO interrupt in NVIC */
-  NVIC_DisableIRQ((IRQn_Type)UULP_GPIO_IRQn);
+  /* Disable the pin interrupt */
+  uint32_t irqn = EGPIO_PIN_0_IRQn + DIO1_INT_CHANNEL;
+  NVIC_DisableIRQ((IRQn_Type)irqn);
   
-  /* Mask UULP GPIO interrupt */
-  volatile uint32_t *uulp_intr_mask_set = (volatile uint32_t *)0x12080000;
-  *uulp_intr_mask_set = (1 << 2);
+  dio1_callback_enabled = false;
   
   DEBUGOUT("LR1121: DIO1 interrupt disabled\n");
 }
 
 /**
  * @brief Read current state of DIO1 pin
+ * 
+ * @return 1 if DIO1 is HIGH, 0 if LOW
  */
 int lr1121_dio1_read(void)
 {
-  return (UULP_GPIO_STATUS_REG >> 2) & 0x01;
+  uint8_t pin_value = 0;
+  sl_gpio_driver_get_pin(&dio1_pin_config.port_pin, &pin_value);
+  return (int)pin_value;
 }
 
 /**
@@ -2404,31 +2451,31 @@ void lr1121_dio1_set_callback(lr1121_dio1_callback_t callback)
 }
 
 /**
- * @brief DIO1 ISR handler (called from IRQ handler)
+ * @brief SDK GPIO interrupt callback - called by SDK interrupt handler
+ * 
+ * For HP GPIO pin interrupts, the flag parameter indicates which interrupt
+ * channel fired (bitmask).
  */
-void lr1121_dio1_isr_handler(void)
+static void dio1_gpio_interrupt_callback(uint32_t flag)
 {
-  /* Read interrupt status */
-  uint32_t status = UULP_GPIO_STATUS_REG;
+  dio1_isr_count++;  /* Debug: count all ISR entries */
   
-  /* Check if GPIO_2 interrupt is active */
-  if (status & (1UL << 2)) {
-    /* Clear the interrupt by writing 1 to the status bit */
-    UULP_GPIO_STATUS_REG = (1UL << 2);
-    
-    /* Call registered callback if set */
-    if (dio1_callback != NULL) {
+  /* Check if this is our interrupt channel */
+  if (flag & (1 << DIO1_INT_CHANNEL)) {
+    /* Only call callback if enabled (after LR1121 init clears IRQs) */
+    if (dio1_callback_enabled && dio1_callback != NULL) {
       dio1_callback();
     }
   }
 }
 
 /**
- * @brief UULP GPIO IRQ Handler - Entry point from NVIC
+ * @brief Get DIO1 ISR count for debugging
+ * @return Number of times the DIO1 ISR callback was entered
  */
-void NPSS_TO_MCU_GPIO_INTR_IRQHandler(void)
+uint32_t lr1121_dio1_get_isr_count(void)
 {
-  lr1121_dio1_isr_handler();
+  return dio1_isr_count;
 }
 
 /**

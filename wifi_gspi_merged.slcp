@@ -25,20 +25,10 @@ source:
 - {path: src/tcxo_diagnostic.c}
 - {path: src/busy_monitor_test.c}
 - {path: src/lr1121_elrs_init.c}
-- {path: src/elrs_protocol/crc.c}
-- {path: src/elrs_protocol/random.c}
-- {path: src/elrs_protocol/fhss.c}
-- {path: src/elrs_protocol/ota.c}
-- {path: src/elrs_protocol/elrs_globals.c}
-- {path: src/elrs_protocol/lr1121_hal.c}
-- {path: src/elrs_protocol/elrs_rx.c}
-- {path: src/elrs_protocol/hw_timer.c}
-- {path: src/elrs_protocol/pfd.c}
-- {path: src/elrs_protocol/lq_calc.c}
-- {path: src/elrs_protocol/lpf.c}
-- {path: src/elrs_protocol/elrs_main.c}
-- {path: src/elrs_protocol/crsf.c}
-- {path: src/elrs_protocol/md5.c}
+- {path: src/elrs_config.c}
+- {path: src/status_led.c}
+- {path: src/bind_button.c}
+- {path: src/md5.c}
 include:
 - path: .
   file_list:
@@ -83,12 +73,13 @@ component:
 - {from: wiseconnect3_sdk, id: basic_network_config_manager}
 - {from: wiseconnect3_sdk, id: brd2708a}
 - {from: wiseconnect3_sdk, id: si91x_memory_default_config}
+- {from: wiseconnect3_sdk, id: sl_config_timer}
+- {from: wiseconnect3_sdk, id: sl_gpio}
 - {from: wiseconnect3_sdk, id: sl_gspi}
 - {from: wiseconnect3_sdk, id: sl_http_server}
 - {from: wiseconnect3_sdk, id: sl_si91x_internal_stack}
 - {from: wiseconnect3_sdk, id: sl_si91x_mem_pool_buffers_with_quota}
 - {from: wiseconnect3_sdk, id: sl_si91x_nvm3}
-
 - {from: wiseconnect3_sdk, id: sl_watchdog_timer}
 - {from: wiseconnect3_sdk, id: syscalls}
 - instance: [timer0]

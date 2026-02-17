@@ -57,7 +57,11 @@
  */
 #define TEST_MODE_SPI_LOOPBACK     13   /* Simple SPI loopback - connect MOSI to MISO */
 #define TEST_MODE_LR1121_SIMPLE    14   /* Simple LR1121 GetVersion test */
-#define TEST_MODE TEST_MODE_ELRS_MAIN  /* ELRS 4.0 main loop - connect to TX */
+#define TEST_MODE_HW_TIMER_TEST    15   /* Configurable Timer accuracy test - NO TX REQUIRED */
+#define TEST_MODE_ELRS_CPP_TEST    16   /* ELRS C++ integration test - NO TX REQUIRED */
+#define TEST_MODE TEST_MODE_ELRS_CPP_TEST  /* ELRS C++ with working DIO1 interrupts */
+// #define TEST_MODE TEST_MODE_HW_TIMER_TEST  /* Configurable Timer accuracy test */
+// #define TEST_MODE TEST_MODE_ELRS_MAIN  /* ELRS 4.0 main loop - connect to TX */
 
 /* ULP Timer only needed for loopback test mode */
 #if (TEST_MODE == TEST_MODE_LOOPBACK)
@@ -74,8 +78,8 @@
 /* LR1121 Standalone Test Suite */
 #include "lr1121_standalone_test.h"
 
-/* LR1121 DIO1 Interrupt Test Suite (Comprehensive) */
-#include "lr1121_dio1_interrupt_test.h"
+/* LR1121 DIO1 Interrupt Test Suite */
+#include "lr1121_dio1_test.h"
 
 /* LR1121 Hardware Test (comprehensive diagnostics) */
 #include "lr1121_hw_test.h"
@@ -86,14 +90,16 @@
 /* TCXO Sweep Test (focused TCXO troubleshooting) */
 #include "lr1121_tcxo_test.h"
 
+/* Hardware Timer Test (CT accuracy verification) */
+#include "hw_timer_test.h"
+
 /* External TCXO Test */
 #include "external_tcxo_test.h"
 
 /* WiFi HTTP Test (for ELRS OTA) */
 #include "wifi_http_test.h"
 
-/* Radio Listen Test (init + RX loop) */
-#include "radio_listen_test.h"
+/* Radio Listen Test - MOVED TO old_c_code_backup (not used) */
 
 /* ELRS Protocol Stack (for TEST_MODE_ELRS_RX - legacy) */
 #if (TEST_MODE == TEST_MODE_ELRS_RX)
@@ -129,8 +135,14 @@
 #endif
 
 /* CMSIS-RTOS2 for FreeRTOS task creation (needed for WiFi and ELRS test modes) */
-#if (TEST_MODE == TEST_MODE_WIFI_HTTP) || (TEST_MODE == TEST_MODE_ELRS_RX) || (TEST_MODE == TEST_MODE_ELRS_MAIN)
+#if (TEST_MODE == TEST_MODE_WIFI_HTTP) || (TEST_MODE == TEST_MODE_ELRS_RX) || (TEST_MODE == TEST_MODE_ELRS_MAIN) || (TEST_MODE == TEST_MODE_ELRS_CPP_TEST)
 #include "cmsis_os2.h"
+#endif
+
+/* WiseConnect SDK for NVM3 access (requires NWP initialization) */
+#if (TEST_MODE == TEST_MODE_ELRS_CPP_TEST)
+#include "sl_net.h"
+#include "sl_wifi.h"
 #endif
 
 /* Legacy compatibility */
@@ -595,12 +607,6 @@ static void elrs_main_task(void *argument)
    **************************************************************************/
   DEBUGOUT("[ELRS_MAIN] Step 1: Initialize configuration storage (NVM3)...\n");
   
-  /* TEMPORARY: Force reset config to clear old UID and use new Lua/WiFi method UID
-   * TODO: Remove this after testing - it will clear config on EVERY boot!
-   */
-  DEBUGOUT("[ELRS_MAIN] *** FORCING CONFIG RESET TO UPDATE UID ***\n");
-  elrs_config_reset();
-  
   if (elrs_config_init() != 0) {
     DEBUGOUT("[ELRS_MAIN] ERROR: Failed to initialize NVM3 configuration\n");
     osThreadExit();
@@ -880,6 +886,124 @@ static void fill_pattern(uint8_t pattern_type)
 /*******************************************************************************
  **************************   GLOBAL FUNCTIONS   *******************************
  ******************************************************************************/
+
+#if (TEST_MODE == TEST_MODE_ELRS_CPP_TEST)
+/*******************************************************************************
+ * ELRS C++ WiFi Mode Flag
+ * 
+ * Set by button callback, checked in main task loop.
+ * This matches the working C implementation pattern.
+ ******************************************************************************/
+#include "wifi_http_test.h"
+
+static volatile bool elrs_cpp_wifi_requested = false;
+
+/* Called from button callback to request WiFi mode */
+void elrs_cpp_request_wifi_mode(void)
+{
+  DEBUGOUT("[ELRS_CPP] WiFi mode requested via button\n");
+  elrs_cpp_wifi_requested = true;
+}
+
+/*******************************************************************************
+ * ELRS C++ FreeRTOS Task
+ * 
+ * Runs the ELRS C++ receiver in a FreeRTOS task context.
+ * This is required for WiFi mode to work (osDelay needs task context).
+ * 
+ * Flow matches working C implementation:
+ *   1. Initialize NWP for NVM3
+ *   2. Initialize ELRS RX
+ *   3. Main loop checks wifi_requested flag
+ *   4. When set, calls wifi_http_test_run() directly from task
+ ******************************************************************************/
+void elrs_cpp_task(void *argument)
+{
+  (void)argument;
+  sl_status_t status;
+  
+  DEBUGOUT("\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("  ExpressLRS Receiver Starting\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("\n");
+  
+  /* Initialize NWP for NVM3 access (binding phrase storage)
+   * CRITICAL: On SiWx917 with common flash, NVM3 requires NWP initialization
+   */
+  DEBUGOUT("[ELRS] Initializing NWP for config storage...\n");
+  status = sl_net_init(SL_NET_WIFI_AP_INTERFACE, NULL, NULL, NULL);
+  if (status != SL_STATUS_OK) {
+    DEBUGOUT("[ELRS] WARNING: sl_net_init() failed: 0x%lX\n", (unsigned long)status);
+    DEBUGOUT("[ELRS]   Config storage may not work - using defaults\n");
+  }
+  
+  /* Initialize ELRS RX - matches upstream rx_main.cpp setup() sequence:
+   *   1. options_init() - load config
+   *   2. setupConfigAndPocCheck() - EEPROM/config init
+   *   3. FHSSrandomiseFHSSsequence() - FHSS channel sequence
+   *   4. Radio.Begin() - initialize radio
+   *   5. Radio callbacks (RXdoneCallback, TXdoneCallback)
+   *   6. SetRFLinkRate() - set initial rate
+   *   7. Radio.RXnb() - start receiving
+   *   8. hwTimer::init() - start timing
+   */
+  extern void elrs_rx_init(void);
+  extern void elrs_rx_start(void);
+  extern void elrs_rx_loop(void);
+  extern void elrs_rx_stop(void);
+  
+  DEBUGOUT("[ELRS] Initializing receiver...\n");
+  elrs_rx_init();
+  
+  DEBUGOUT("\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("  ExpressLRS RX Ready\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("  Short press BTN1 -> WiFi mode\n");
+  DEBUGOUT("  Long press BTN1  -> Binding mode\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("\n");
+  
+  elrs_rx_start();
+  
+  /* Main loop - standard ELRS RX loop */
+  while (1) {
+    /* Check WiFi mode request flag (set by button callback) */
+    if (elrs_cpp_wifi_requested) {
+      elrs_cpp_wifi_requested = false;
+      
+      DEBUGOUT("\n");
+      DEBUGOUT("========================================\n");
+      DEBUGOUT("  Entering WiFi Configuration Mode\n");
+      DEBUGOUT("========================================\n");
+      DEBUGOUT("  SSID: ELRS_TEST_AP\n");
+      DEBUGOUT("  Password: elrs1234\n");
+      DEBUGOUT("  Web UI: http://192.168.10.10/\n");
+      DEBUGOUT("========================================\n");
+      DEBUGOUT("\n");
+      
+      /* Stop RX before starting WiFi */
+      elrs_rx_stop();
+      
+      /* Start WiFi HTTP server - blocks until reboot/exit */
+      wifi_http_test_run();
+      
+      /* If we return, restart RX */
+      DEBUGOUT("[ELRS] WiFi mode ended, resuming RX...\n");
+      elrs_rx_start();
+      continue;
+    }
+    
+    /* Normal RX processing - matches upstream loop() */
+    elrs_rx_loop();
+    
+    /* Yield to FreeRTOS scheduler */
+    osDelay(1);
+  }
+}
+#endif /* TEST_MODE_ELRS_CPP_TEST */
+
 /*******************************************************************************
  * GSPI example initialization function
  ******************************************************************************/
@@ -1024,6 +1148,77 @@ void gspi_example_init(void)
   /* Set mode to completed so process_action does nothing */
   current_mode = SL_GSPI_TRANSMISSION_COMPLETED;
 
+#elif (TEST_MODE == TEST_MODE_HW_TIMER_TEST)
+  /* Configurable Timer (CT) Accuracy Test
+   *
+   * This mode tests the hw_timer implementation which provides
+   * precise tick/tock timing for ELRS packet synchronization.
+   *
+   * Tests performed:
+   *   1. Timer initialization with known interval
+   *   2. Callback counting (tick + tock)
+   *   3. Timing accuracy measurement
+   *   4. Jitter analysis
+   *   5. Phase shift API validation
+   *
+   * Expected results:
+   *   - Timing accuracy < 1% error (crystal accuracy from 16MHz PLL)
+   *   - All callbacks fired correctly
+   *
+   * NO TRANSMITTER REQUIRED - tests internal timer only.
+   */
+  DEBUGOUT("\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("  GSPI Example: HW Timer Test\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("\n");
+  DEBUGOUT("Testing Configurable Timer (CT) accuracy\n");
+  DEBUGOUT("for ELRS tick/tock timing.\n");
+  DEBUGOUT("\n");
+  
+  /* Run accuracy test */
+  hw_timer_test_run();
+  
+  /* Run phase shift API test */
+  hw_timer_test_phase_shift();
+  
+  DEBUGOUT("\nAll timer tests complete.\n");
+  
+  /* Set mode to completed so process_action does nothing */
+  current_mode = SL_GSPI_TRANSMISSION_COMPLETED;
+
+#elif (TEST_MODE == TEST_MODE_ELRS_CPP_TEST)
+  /* ELRS C++ Integration - FreeRTOS Task
+   *
+   * Runs ELRS C++ code in a FreeRTOS task so WiFi mode works properly.
+   * WiFi HTTP server requires FreeRTOS for osDelay() and task scheduling.
+   */
+  DEBUGOUT("\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("  ELRS C++ (FreeRTOS Task Mode)\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("\n");
+  DEBUGOUT("Creating FreeRTOS task for ELRS C++ RX...\n");
+  DEBUGOUT("\n");
+  
+  /* Create FreeRTOS task for ELRS - defined below */
+  extern void elrs_cpp_task(void *argument);
+  
+  static const osThreadAttr_t elrs_cpp_task_attributes = {
+    .name = "elrs_cpp_task",
+    .stack_size = 8192,
+    .priority = osPriorityNormal
+  };
+  
+  osThreadId_t task_handle = osThreadNew(elrs_cpp_task, NULL, &elrs_cpp_task_attributes);
+  if (task_handle == NULL) {
+    DEBUGOUT("ERROR: Failed to create ELRS C++ task!\n");
+  } else {
+    DEBUGOUT("ELRS C++ task created - will start after scheduler\n");
+  }
+  
+  current_mode = SL_GSPI_TRANSMISSION_COMPLETED;
+
 #elif (TEST_MODE == TEST_MODE_STANDALONE_TESTS)
   /* LR1121 Standalone Test Suite - No second receiver required */
   DEBUGOUT("\n");
@@ -1045,29 +1240,40 @@ void gspi_example_init(void)
   current_mode = SL_GSPI_TRANSMISSION_COMPLETED;
 
 #elif (TEST_MODE == TEST_MODE_DIO1_TEST)
-  /* DIO1 Comprehensive Interrupt Test Suite
+  /* DIO1 Interrupt Test Suite
    *
-   * Citation: lr1121_dio1_interrupt_test.c - Comprehensive test suite
+   * Citation: lr1121_dio1_test.c - DIO1 test suite
    * Hardware: SiW917 BRD2708A UULP_VBAT_GPIO_2 connected to LR1121 DIO1
    * Citation: UG590 BRD2708A User Guide Section 3.8.2 Table 3.3:
    *   "INT - Hardware Interrupt - UULP_VBAT_GPIO_2"
    *
-   * This mode tests END-TO-END interrupt operation:
-   * - Test 1: DIO1 IRQ configuration (SetDioIrqParams)
-   * - Test 2: RX Timeout interrupt triggering (DIO1 fires on timeout)
-   * - Test 3: osThreadFlagsWait() signaling from ISR
-   * - Test 4: Multiple consecutive interrupts (stress test)
-   * - Test 5: DIO1 pin state correlation with IRQ status
+   * This mode tests DIO1 interrupt infrastructure:
+   * - Test 1: GPIO pin read
+   * - Test 2: Callback registration  
+   * - Test 3: Interrupt enable/disable
+   * - Test 4: IRQ status read
+   * - Test 5: SetDioIrqParams
+   * - Test 6: DIO1 Toggle Test (verifies LR1121 can control DIO1)
    */
   DEBUGOUT("\n");
   DEBUGOUT("========================================================\n");
-  DEBUGOUT("  GSPI Example: DIO1 COMPREHENSIVE Interrupt Tests\n");
+  DEBUGOUT("  GSPI Example: DIO1 Interrupt Tests\n");
   DEBUGOUT("========================================================\n");
   DEBUGOUT("\n");
   
-  /* Run the comprehensive DIO1 interrupt test suite
-   * Note: This calls lr1121_hal_init() internally which initializes LR1121 */
-  lr1121_dio1_interrupt_run_all_tests();
+  /* Initialize LR1121 SPI and radio first - required for DIO1 tests */
+  DEBUGOUT("Initializing LR1121 (SPI + TCXO + Radio)...\n");
+  lr1121_status_t init_status = lr1121_init();
+  if (init_status != LR1121_OK) {
+    DEBUGOUT("ERROR: LR1121 init failed with code %d\n", init_status);
+    DEBUGOUT("DIO1 tests require working SPI communication!\n");
+    current_mode = SL_GSPI_TRANSMISSION_COMPLETED;
+  } else {
+    DEBUGOUT("LR1121 initialized OK - running DIO1 tests\n\n");
+    
+    /* Run the DIO1 test suite from lr1121_dio1_test.c */
+    lr1121_dio1_run_all_tests();
+  }
   
   /* Set mode to completed so process_action does nothing */
   current_mode = SL_GSPI_TRANSMISSION_COMPLETED;
@@ -1587,7 +1793,7 @@ static void print_test_summary(void)
  ******************************************************************************/
 void gspi_example_process_action(void)
 {
-#if (TEST_MODE == TEST_MODE_RADIO_LISTEN) || (TEST_MODE == TEST_MODE_WIFI_HTTP) || (TEST_MODE == TEST_MODE_EXTERNAL_TCXO) || (TEST_MODE == TEST_MODE_TCXO_DIAGNOSTIC) || (TEST_MODE == TEST_MODE_STANDALONE_TESTS) || (TEST_MODE == TEST_MODE_GPIO_TOGGLE) || (TEST_MODE == TEST_MODE_BUSY_MONITOR) || (TEST_MODE == TEST_MODE_LR1121_SPI) || (TEST_MODE == TEST_MODE_ELRS_RX) || (TEST_MODE == TEST_MODE_DIO1_TEST) || (TEST_MODE == TEST_MODE_ELRS_MAIN) || (TEST_MODE == TEST_MODE_TCXO_SWEEP) || (TEST_MODE == TEST_MODE_SPI_LOOPBACK) || (TEST_MODE == TEST_MODE_LR1121_SIMPLE)
+#if (TEST_MODE == TEST_MODE_RADIO_LISTEN) || (TEST_MODE == TEST_MODE_WIFI_HTTP) || (TEST_MODE == TEST_MODE_EXTERNAL_TCXO) || (TEST_MODE == TEST_MODE_TCXO_DIAGNOSTIC) || (TEST_MODE == TEST_MODE_STANDALONE_TESTS) || (TEST_MODE == TEST_MODE_GPIO_TOGGLE) || (TEST_MODE == TEST_MODE_BUSY_MONITOR) || (TEST_MODE == TEST_MODE_LR1121_SPI) || (TEST_MODE == TEST_MODE_ELRS_RX) || (TEST_MODE == TEST_MODE_DIO1_TEST) || (TEST_MODE == TEST_MODE_ELRS_MAIN) || (TEST_MODE == TEST_MODE_TCXO_SWEEP) || (TEST_MODE == TEST_MODE_SPI_LOOPBACK) || (TEST_MODE == TEST_MODE_LR1121_SIMPLE) || (TEST_MODE == TEST_MODE_HW_TIMER_TEST) || (TEST_MODE == TEST_MODE_ELRS_CPP_TEST)
   /* All non-loopback test modes - nothing to do, test runs in init or FreeRTOS task */
   (void)current_mode; /* Suppress unused variable warning */
 #else

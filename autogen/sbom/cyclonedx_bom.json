@@ -3,7 +3,7 @@
   "specVersion" : "1.6",
   "version" : 1,
   "metadata" : {
-    "timestamp" : "2026-01-14T02:29:23Z",
+    "timestamp" : "2026-02-03T03:14:16Z",
     "authors" : [ {
       "name" : "Silicon Laboratories, Inc."
     } ],
@@ -57,6 +57,24 @@
     }, {
       "scope" : "required",
       "type" : "library",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:sl_config_timer",
+      "name" : "Config Timer",
+      "version" : "3.5.2",
+      "licenses" : [ {
+        "expression" : "Zlib"
+      } ]
+    }, {
+      "scope" : "required",
+      "type" : "library",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:sl_gpio",
+      "name" : "GPIO",
+      "version" : "3.5.2",
+      "licenses" : [ {
+        "expression" : "Zlib"
+      } ]
+    }, {
+      "scope" : "required",
+      "type" : "library",
       "bom-ref" : "wiseconnect3_sdk:3.5.2:sl_gspi",
       "name" : "GSPI",
       "version" : "3.5.2",
@@ -102,8 +120,8 @@
     }, {
       "scope" : "required",
       "type" : "library",
-      "bom-ref" : "wiseconnect3_sdk:3.5.2:sl_usart",
-      "name" : "USART",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:sl_watchdog_timer",
+      "name" : "WDT",
       "version" : "3.5.2",
       "licenses" : [ {
         "expression" : "Zlib"
@@ -183,6 +201,15 @@
     }, {
       "scope" : "required",
       "type" : "library",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:romdriver_ct",
+      "name" : "ROM DRIVER CT",
+      "version" : "3.5.2",
+      "licenses" : [ {
+        "expression" : "Zlib"
+      } ]
+    }, {
+      "scope" : "required",
+      "type" : "library",
       "bom-ref" : "wiseconnect3_sdk:3.5.2:sl_si91x_common_flash_nvm3",
       "name" : "NVM3 Common Flash",
       "version" : "3.5.2",
@@ -197,6 +224,15 @@
       "version" : "3.5.2",
       "licenses" : [ {
         "expression" : "Apache-2.0 AND Zlib"
+      } ]
+    }, {
+      "scope" : "required",
+      "type" : "library",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:systemlevel_power_save",
+      "name" : "POWER SAVE",
+      "version" : "3.5.2",
+      "licenses" : [ {
+        "expression" : "Zlib"
       } ]
     }, {
       "scope" : "required",
@@ -302,6 +338,15 @@
       "type" : "library",
       "bom-ref" : "wiseconnect3_sdk:3.5.2:rsilib_udma",
       "name" : "UDMA",
+      "version" : "3.5.2",
+      "licenses" : [ {
+        "expression" : "Zlib"
+      } ]
+    }, {
+      "scope" : "required",
+      "type" : "library",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:sl_gpio_peripheral",
+      "name" : "SL GPIO Peripheral",
       "version" : "3.5.2",
       "licenses" : [ {
         "expression" : "Zlib"
@@ -650,6 +695,15 @@
     }, {
       "scope" : "required",
       "type" : "library",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:romdriver_power_save",
+      "name" : "ROM DRIVER POWER SAVE",
+      "version" : "3.5.2",
+      "licenses" : [ {
+        "expression" : "Zlib"
+      } ]
+    }, {
+      "scope" : "required",
+      "type" : "library",
       "bom-ref" : "wiseconnect3_sdk:3.5.2:freertos_config",
       "name" : "SL SI91X FreeRTOS Configuration",
       "version" : "3.5.2",
@@ -724,6 +778,15 @@
       "type" : "library",
       "bom-ref" : "wiseconnect3_sdk:3.5.2:romdriver_romtable",
       "name" : "ROM TABLE",
+      "version" : "3.5.2",
+      "licenses" : [ {
+        "expression" : "Zlib"
+      } ]
+    }, {
+      "scope" : "required",
+      "type" : "library",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:systemlevel_wwdt",
+      "name" : "WWDT",
       "version" : "3.5.2",
       "licenses" : [ {
         "expression" : "Zlib"
@@ -866,35 +929,8 @@
     }, {
       "scope" : "required",
       "type" : "library",
-      "bom-ref" : "wiseconnect3_sdk:3.5.2:sl_watchdog_timer",
-      "name" : "WDT",
-      "version" : "3.5.2",
-      "licenses" : [ {
-        "expression" : "Zlib"
-      } ]
-    }, {
-      "scope" : "required",
-      "type" : "library",
-      "bom-ref" : "wiseconnect3_sdk:3.5.2:systemlevel_power_save",
-      "name" : "POWER SAVE",
-      "version" : "3.5.2",
-      "licenses" : [ {
-        "expression" : "Zlib"
-      } ]
-    }, {
-      "scope" : "required",
-      "type" : "library",
-      "bom-ref" : "wiseconnect3_sdk:3.5.2:romdriver_power_save",
-      "name" : "ROM DRIVER POWER SAVE",
-      "version" : "3.5.2",
-      "licenses" : [ {
-        "expression" : "Zlib"
-      } ]
-    }, {
-      "scope" : "required",
-      "type" : "library",
-      "bom-ref" : "wiseconnect3_sdk:3.5.2:systemlevel_wwdt",
-      "name" : "WWDT",
+      "bom-ref" : "wiseconnect3_sdk:3.5.2:rsilib_ct",
+      "name" : "CT",
       "version" : "3.5.2",
       "licenses" : [ {
         "expression" : "Zlib"

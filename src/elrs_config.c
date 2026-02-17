@@ -26,7 +26,7 @@
 /* MD5 for binding phrase to UID conversion
  * Citation: ExpressLRS uses MD5 hash of binding phrase, first 6 bytes = UID
  */
-#include "elrs_protocol/md5.h"
+#include "md5.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -347,10 +347,20 @@ int elrs_config_save(void)
    * 
    * Citation: Silicon Labs NVM3 API - nvm3_writeData()
    * WARNING: This can hang if NWP is busy or flash access conflicts occur!
+   * 
+   * Add small delay to let WiFi stack settle before flash access.
+   * This helps avoid NWP/M4 flash access contention.
    */
   DEBUGOUT("[Config] Calling nvm3_writeData() - handle=%p, key=0x%lX, size=%u...\n",
            (void*)nvm3_defaultHandle, (unsigned long)NVM3_KEY_ELRS_CONFIG, 
            (unsigned int)sizeof(g_config));
+  fflush(stdout);
+  
+  /* Small delay to let WiFi/NWP settle before flash write */
+  extern void osDelay(uint32_t ticks);
+  osDelay(50);  /* 50ms delay */
+  
+  DEBUGOUT("[Config] Executing nvm3_writeData()...\n");
   fflush(stdout);
   
   status = nvm3_writeData(nvm3_defaultHandle, NVM3_KEY_ELRS_CONFIG,

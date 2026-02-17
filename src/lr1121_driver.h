@@ -609,9 +609,10 @@ void lr1121_dio1_enable(void);
 void lr1121_dio1_disable(void);
 
 /**
- * @brief DIO1 ISR handler (called from IRQ021_Handler)
+ * @brief Get DIO1 ISR count for debugging
+ * @return Number of times the DIO1 ISR callback was entered
  */
-void lr1121_dio1_isr_handler(void);
+uint32_t lr1121_dio1_get_isr_count(void);
 
 #ifdef __cplusplus
 }

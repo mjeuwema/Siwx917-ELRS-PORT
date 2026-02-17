@@ -139,8 +139,10 @@ static bool was_pressed = false;
 static bool initialized = false;
 static uint32_t init_tick = 0;
 
-/* Debounce time in ms after init before accepting button presses */
-#define INIT_DEBOUNCE_MS  500
+/* Debounce time in ms after init before accepting button presses 
+ * Increased to 2000ms to avoid false triggers during boot
+ */
+#define INIT_DEBOUNCE_MS  2000
 
 /*******************************************************************************
  * Public Functions
@@ -275,6 +277,13 @@ void bind_button_poll(void)
      */
     if ((now - init_tick) < INIT_DEBOUNCE_MS) {
         /* Still in debounce period - just track state without triggering */
+        static uint32_t last_debounce_print = 0;
+        if ((now - last_debounce_print) > 500) {
+            last_debounce_print = now;
+            BTN_DBG("Debounce: %lu/%d ms, btn=%s\n", 
+                    (unsigned long)(now - init_tick), INIT_DEBOUNCE_MS,
+                    bind_button_is_pressed() ? "PRESSED" : "released");
+        }
         was_pressed = bind_button_is_pressed();
         return;
     }

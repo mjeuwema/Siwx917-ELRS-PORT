@@ -63,7 +63,7 @@ extern "C" {
 #define SL_GSPI_MASTER_PERIPHERAL                GSPI_MASTER
 #endif
 
-// GSPI_MASTER SCK_ on GPIO_25 (mikroBUS socket)
+// GSPI_MASTER SCK_ on GPIO_25
 #ifndef SL_GSPI_MASTER_SCK__PORT                
 #define SL_GSPI_MASTER_SCK__PORT                 HP
 #endif
@@ -74,7 +74,7 @@ extern "C" {
 #define SL_GSPI_MASTER_SCK_LOC                   1
 #endif
 
-// GSPI_MASTER CS0_ on GPIO_28 (mikroBUS socket)
+// GSPI_MASTER CS0_ on GPIO_28
 #ifndef SL_GSPI_MASTER_CS0__PORT                
 #define SL_GSPI_MASTER_CS0__PORT                 HP
 #endif
@@ -87,7 +87,7 @@ extern "C" {
 
 
 
-// GSPI_MASTER MOSI_ on GPIO_27 (mikroBUS socket)
+// GSPI_MASTER MOSI_ on GPIO_27
 #ifndef SL_GSPI_MASTER_MOSI__PORT               
 #define SL_GSPI_MASTER_MOSI__PORT                HP
 #endif
@@ -98,7 +98,7 @@ extern "C" {
 #define SL_GSPI_MASTER_MOSI_LOC                  17
 #endif
 
-// GSPI_MASTER MISO_ on GPIO_26 (mikroBUS socket)
+// GSPI_MASTER MISO_ on GPIO_26
 #ifndef SL_GSPI_MASTER_MISO__PORT               
 #define SL_GSPI_MASTER_MISO__PORT                HP
 #endif

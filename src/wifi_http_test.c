@@ -390,6 +390,7 @@ static volatile bool ap_running = false;
 static volatile bool server_running = false;
 static volatile uint32_t client_count = 0;
 static volatile uint32_t request_count = 0;
+static volatile bool config_save_pending = false;  /* Deferred NVM3 save flag */
 
 /* HTTP Server handle */
 static sl_http_server_t server_handle = { 0 };
@@ -697,32 +698,22 @@ static sl_status_t handle_config_post(sl_http_server_t *handle, sl_http_server_r
     return sl_http_server_send_response(handle, &response);
   }
 
-  /* Save configuration to NVM3
-   * Citation: elrs_config.c - elrs_config_save()
+  /* Mark config for deferred save
+   * 
+   * IMPORTANT: NVM3 writes can hang when called from HTTP callback context
+   * while WiFi is active (NWP/M4 flash contention). Instead of saving here,
+   * we set a flag that the main loop checks and performs the save outside
+   * the HTTP callback context.
+   * 
+   * Citation: Silicon Labs Common Flash mode - NWP and M4 share flash access
    */
-  DEBUGOUT("[HTTP] About to call elrs_config_save()...\n");
-  fflush(stdout);  /* Force buffer flush before potential hang */
-  
-  result = elrs_config_save();
-  
-  DEBUGOUT("[HTTP] elrs_config_save() returned: %d\n", result);
-  if (result != 0) {
-    DEBUGOUT("[HTTP] ERROR: Failed to save config to NVM3: %d\n", result);
-    int len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
-                       "{\"status\":\"error\",\"msg\":\"Failed to save configuration\"}");
-    response.response_code        = SL_HTTP_RESPONSE_INTERNAL_SERVER_ERROR;
-    response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
-    response.headers              = headers;
-    response.header_count         = 5;  /* Include CORS headers */
-    response.data                 = (uint8_t *)response_buffer;
-    response.current_data_length  = len;
-    response.expected_data_length = len;
-    return sl_http_server_send_response(handle, &response);
-  }
+  DEBUGOUT("[HTTP] Config updated - marking for deferred save\n");
+  extern void wifi_http_request_config_save(void);
+  wifi_http_request_config_save();
 
-  /* Success response */
+  /* Success response - config will be saved by main loop */
   int len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
-                     "{\"status\":\"ok\",\"msg\":\"Configuration saved to flash\"}");
+                     "{\"status\":\"ok\",\"msg\":\"Configuration updated (saving...)\"}");
 
   response.response_code        = SL_HTTP_RESPONSE_OK;
   response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
@@ -732,7 +723,7 @@ static sl_status_t handle_config_post(sl_http_server_t *handle, sl_http_server_r
   response.current_data_length  = len;
   response.expected_data_length = len;
 
-  DEBUGOUT("[HTTP] Config saved OK\n");
+  DEBUGOUT("[HTTP] Sending response, save will happen in main loop\n");
 
   return sl_http_server_send_response(handle, &response);
 }
@@ -3458,10 +3449,25 @@ void wifi_http_test_run(void)
 
   /* Main Loop */
   while (server_running) {
-    osDelay(1000);
+    osDelay(100);  /* Check more frequently for pending saves */
+
+    /* Check for deferred config save
+     * NVM3 writes hang when called from HTTP callback context.
+     * Doing it here in the main loop avoids the NWP/M4 flash contention.
+     */
+    if (config_save_pending) {
+      config_save_pending = false;
+      DEBUGOUT("[WiFi] Performing deferred config save...\n");
+      int result = elrs_config_save();
+      if (result == 0) {
+        DEBUGOUT("[WiFi] Config saved to NVM3 successfully!\n");
+      } else {
+        DEBUGOUT("[WiFi] ERROR: Config save failed: %d\n", result);
+      }
+    }
 
     static uint32_t tick = 0;
-    if (++tick % 30 == 0) {
+    if (++tick % 300 == 0) {  /* Every 30 seconds (300 * 100ms) */
       DEBUGOUT("[Status] Clients: %lu, Requests: %lu, Uptime: %lu ms\n",
                client_count, request_count, osKernelGetTickCount());
     }
@@ -3477,6 +3483,19 @@ void wifi_http_test_run(void)
   ap_running = false;
 
   DEBUGOUT("WiFi HTTP test complete.\n");
+}
+
+/*******************************************************************************
+ * Deferred Config Save
+ * 
+ * Called from HTTP POST handler to request a config save.
+ * The actual save happens in the main loop to avoid NWP/M4 flash contention.
+ ******************************************************************************/
+
+void wifi_http_request_config_save(void)
+{
+  DEBUGOUT("[WiFi] Config save requested (will save in main loop)\n");
+  config_save_pending = true;
 }
 
 /*******************************************************************************

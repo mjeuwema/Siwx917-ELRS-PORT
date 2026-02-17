@@ -443,11 +443,11 @@ void lr1121_elrs_print_status(void);
  * Citation: TCXO stress test validation 2026-01-24
  */
 #ifndef TCXO_ACTIVE_VOLTAGE
-#define TCXO_ACTIVE_VOLTAGE  0x00  /* External TCXO - NO internal regulator */
+#define TCXO_ACTIVE_VOLTAGE  0x06  /* 3.0V - Waveshare demo setting */
 #endif
 
 #ifndef TCXO_ACTIVE_DELAY
-#define TCXO_ACTIVE_DELAY    164  /* 164 ticks = ~5ms - validated by stress testing */
+#define TCXO_ACTIVE_DELAY    656  /* 656 ticks = ~20ms - RECOMMENDED for reliable wake-from-sleep */
 #endif
 
 /**

@@ -5,7 +5,7 @@
   "name" : "Silicon-Laboratories",
   "documentNamespace" : "https://silabs.com",
   "creationInfo" : {
-    "created" : "2026-01-14T02:29:23Z",
+    "created" : "2026-02-03T03:14:16Z",
     "creators" : [ "Tool: Silicon Labs Configuration Tooling" ]
   },
   "comment" : "TERMS OF USE - SILICON LABORATORIES INC.\n(With respect to Silicon Labs software components, this Software Bill of Materials (SBOM) is based upon Silicon Labs'\nreview and analysis of the code version when released.  It is provided \"AS IS\" and does not modify, change or alter\nthe terms or conditions of your use of Silicon Labs' software and/or SDKs based upon license terms and/or agreements\nassociated with this software or SDKs when distributed to you, received by you, or installed by you.  Further, no\nwarranties or obligations are created by this SBOM.  It is your obligation to comply with the terms of licenses\nreferenced in this SBOM.)",
@@ -44,6 +44,22 @@
   }, {
     "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-si91x_memory_default_config",
     "name" : "Default RAM Memory Configuration",
+    "versionInfo" : "3.5.2",
+    "primaryPackagePurpose" : "LIBRARY",
+    "downloadLocation" : "NOASSERTION",
+    "supplier" : "Organization: NOASSERTION",
+    "licenseConcluded" : "Zlib"
+  }, {
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_config_timer",
+    "name" : "Config Timer",
+    "versionInfo" : "3.5.2",
+    "primaryPackagePurpose" : "LIBRARY",
+    "downloadLocation" : "NOASSERTION",
+    "supplier" : "Organization: NOASSERTION",
+    "licenseConcluded" : "Zlib"
+  }, {
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_gpio",
+    "name" : "GPIO",
     "versionInfo" : "3.5.2",
     "primaryPackagePurpose" : "LIBRARY",
     "downloadLocation" : "NOASSERTION",
@@ -90,8 +106,8 @@
     "supplier" : "Organization: NOASSERTION",
     "licenseConcluded" : "MSLA"
   }, {
-    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_usart",
-    "name" : "USART",
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_watchdog_timer",
+    "name" : "WDT",
     "versionInfo" : "3.5.2",
     "primaryPackagePurpose" : "LIBRARY",
     "downloadLocation" : "NOASSERTION",
@@ -162,6 +178,14 @@
     "supplier" : "Organization: NOASSERTION",
     "licenseConcluded" : "Zlib"
   }, {
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-romdriver_ct",
+    "name" : "ROM DRIVER CT",
+    "versionInfo" : "3.5.2",
+    "primaryPackagePurpose" : "LIBRARY",
+    "downloadLocation" : "NOASSERTION",
+    "supplier" : "Organization: NOASSERTION",
+    "licenseConcluded" : "Zlib"
+  }, {
     "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_si91x_common_flash_nvm3",
     "name" : "NVM3 Common Flash",
     "versionInfo" : "3.5.2",
@@ -177,6 +201,14 @@
     "downloadLocation" : "NOASSERTION",
     "supplier" : "Organization: NOASSERTION",
     "licenseConcluded" : "Apache-2.0 AND Zlib"
+  }, {
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-systemlevel_power_save",
+    "name" : "POWER SAVE",
+    "versionInfo" : "3.5.2",
+    "primaryPackagePurpose" : "LIBRARY",
+    "downloadLocation" : "NOASSERTION",
+    "supplier" : "Organization: NOASSERTION",
+    "licenseConcluded" : "Zlib"
   }, {
     "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-cmsis_driver_headers",
     "name" : "CMSIS Driver Header Files",
@@ -268,6 +300,14 @@
   }, {
     "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-rsilib_udma",
     "name" : "UDMA",
+    "versionInfo" : "3.5.2",
+    "primaryPackagePurpose" : "LIBRARY",
+    "downloadLocation" : "NOASSERTION",
+    "supplier" : "Organization: NOASSERTION",
+    "licenseConcluded" : "Zlib"
+  }, {
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_gpio_peripheral",
+    "name" : "SL GPIO Peripheral",
     "versionInfo" : "3.5.2",
     "primaryPackagePurpose" : "LIBRARY",
     "downloadLocation" : "NOASSERTION",
@@ -576,6 +616,14 @@
     "supplier" : "Organization: NOASSERTION",
     "licenseConcluded" : "Zlib"
   }, {
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-romdriver_power_save",
+    "name" : "ROM DRIVER POWER SAVE",
+    "versionInfo" : "3.5.2",
+    "primaryPackagePurpose" : "LIBRARY",
+    "downloadLocation" : "NOASSERTION",
+    "supplier" : "Organization: NOASSERTION",
+    "licenseConcluded" : "Zlib"
+  }, {
     "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-freertos_config",
     "name" : "SL SI91X FreeRTOS Configuration",
     "versionInfo" : "3.5.2",
@@ -642,6 +690,14 @@
   }, {
     "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-romdriver_romtable",
     "name" : "ROM TABLE",
+    "versionInfo" : "3.5.2",
+    "primaryPackagePurpose" : "LIBRARY",
+    "downloadLocation" : "NOASSERTION",
+    "supplier" : "Organization: NOASSERTION",
+    "licenseConcluded" : "Zlib"
+  }, {
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-systemlevel_wwdt",
+    "name" : "WWDT",
     "versionInfo" : "3.5.2",
     "primaryPackagePurpose" : "LIBRARY",
     "downloadLocation" : "NOASSERTION",
@@ -768,32 +824,8 @@
     "supplier" : "Organization: NOASSERTION",
     "licenseConcluded" : "Zlib"
   }, {
-    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_watchdog_timer",
-    "name" : "WDT",
-    "versionInfo" : "3.5.2",
-    "primaryPackagePurpose" : "LIBRARY",
-    "downloadLocation" : "NOASSERTION",
-    "supplier" : "Organization: NOASSERTION",
-    "licenseConcluded" : "Zlib"
-  }, {
-    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-systemlevel_power_save",
-    "name" : "POWER SAVE",
-    "versionInfo" : "3.5.2",
-    "primaryPackagePurpose" : "LIBRARY",
-    "downloadLocation" : "NOASSERTION",
-    "supplier" : "Organization: NOASSERTION",
-    "licenseConcluded" : "Zlib"
-  }, {
-    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-romdriver_power_save",
-    "name" : "ROM DRIVER POWER SAVE",
-    "versionInfo" : "3.5.2",
-    "primaryPackagePurpose" : "LIBRARY",
-    "downloadLocation" : "NOASSERTION",
-    "supplier" : "Organization: NOASSERTION",
-    "licenseConcluded" : "Zlib"
-  }, {
-    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-systemlevel_wwdt",
-    "name" : "WWDT",
+    "SPDXID" : "SPDXRef-wiseconnect3_sdk-3.5.2-rsilib_ct",
+    "name" : "CT",
     "versionInfo" : "3.5.2",
     "primaryPackagePurpose" : "LIBRARY",
     "downloadLocation" : "NOASSERTION",
@@ -1179,6 +1211,14 @@
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_config_timer",
+    "relationshipType" : "CONTAINS"
+  }, {
+    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_gpio",
+    "relationshipType" : "CONTAINS"
+  }, {
+    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
     "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_gspi",
     "relationshipType" : "CONTAINS"
   }, {
@@ -1199,7 +1239,7 @@
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
-    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_usart",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_watchdog_timer",
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
@@ -1235,11 +1275,19 @@
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-romdriver_ct",
+    "relationshipType" : "CONTAINS"
+  }, {
+    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
     "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_si91x_common_flash_nvm3",
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
     "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-cmsis_usart",
+    "relationshipType" : "CONTAINS"
+  }, {
+    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-systemlevel_power_save",
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
@@ -1288,6 +1336,10 @@
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
     "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-rsilib_udma",
+    "relationshipType" : "CONTAINS"
+  }, {
+    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_gpio_peripheral",
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
@@ -1439,6 +1491,10 @@
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-romdriver_power_save",
+    "relationshipType" : "CONTAINS"
+  }, {
+    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
     "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-freertos_config",
     "relationshipType" : "CONTAINS"
   }, {
@@ -1472,6 +1528,10 @@
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
     "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-romdriver_romtable",
+    "relationshipType" : "CONTAINS"
+  }, {
+    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-systemlevel_wwdt",
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
@@ -1535,19 +1595,7 @@
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
-    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-sl_watchdog_timer",
-    "relationshipType" : "CONTAINS"
-  }, {
-    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
-    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-systemlevel_power_save",
-    "relationshipType" : "CONTAINS"
-  }, {
-    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
-    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-romdriver_power_save",
-    "relationshipType" : "CONTAINS"
-  }, {
-    "spdxElementId" : "SPDXRef-wiseconnect3_sdk-3.5.2",
-    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-systemlevel_wwdt",
+    "relatedSpdxElement" : "SPDXRef-wiseconnect3_sdk-3.5.2-rsilib_ct",
     "relationshipType" : "CONTAINS"
   }, {
     "spdxElementId" : "SPDXRef-simplicity_sdk-2025.6.2",

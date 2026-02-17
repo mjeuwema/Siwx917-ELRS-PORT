@@ -3637,8 +3637,19 @@
 // </e>(Generic SPI master)[Driver_GSPI_MASTER]
 
 // <o>(State Configurable Timer) Interface
-#define SCT_CLOCK_SOURCE   CT_INTFPLLCLK
-#define SCT_CLOCK_DIV_FACT 2
+// ELRS Timer Configuration:
+//   Clock Source: CT_SOCPLLCLK (SOC PLL, crystal-derived)
+//   - CT uses PLL clock in range 40-160 MHz (per Timer guide)
+//   - Stable at boot (unlike INTF_PLL which may not be ready)
+//   - Crystal-accurate timing matches RF synthesizer stability
+//   Divider: 63 (maximum for 6-bit field)
+//   - With 160MHz PLL: CT clock = 160MHz / (2*63) = 1.27 MHz
+//   - With 40MHz PLL: CT clock = 40MHz / (2*63) = 0.32 MHz  
+//   - 16-bit max at 1.27MHz: ~51ms (safe for ELRS 20ms)
+//   - Use SDK's sl_si91x_config_timer_get_match_value() for accurate conversion
+// Citation: SiWx917 Timer Guide, RM Section 6.13.18.11 CLK_CONFIG_REG5
+#define SCT_CLOCK_SOURCE   CT_SOCPLLCLK
+#define SCT_CLOCK_DIV_FACT 63
 
 //SCT_IN_0  <0=>GPIO_25  <1=>GPIO_64 <2=>GPIO_68
 

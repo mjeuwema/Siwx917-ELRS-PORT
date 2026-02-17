@@ -10,7 +10,7 @@ referenced in this SBOM.)
 -->
 <bom xmlns="http://cyclonedx.org/schema/bom/1.6" version="1">
   <metadata>
-    <timestamp>2026-01-14T02:29:23Z</timestamp>
+    <timestamp>2026-02-03T03:14:16Z</timestamp>
     <authors>
       <author>
         <name>Silicon Laboratories, Inc.</name>
@@ -45,6 +45,20 @@ referenced in this SBOM.)
         </component>
         <component bom-ref="wiseconnect3_sdk:3.5.2:si91x_memory_default_config" type="library">
           <name>Default RAM Memory Configuration</name>
+          <version>3.5.2</version>
+          <licenses>
+            <expression>Zlib</expression>
+          </licenses>
+        </component>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:sl_config_timer" type="library">
+          <name>Config Timer</name>
+          <version>3.5.2</version>
+          <licenses>
+            <expression>Zlib</expression>
+          </licenses>
+        </component>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:sl_gpio" type="library">
+          <name>GPIO</name>
           <version>3.5.2</version>
           <licenses>
             <expression>Zlib</expression>
@@ -85,8 +99,8 @@ referenced in this SBOM.)
             <expression>MSLA</expression>
           </licenses>
         </component>
-        <component bom-ref="wiseconnect3_sdk:3.5.2:sl_usart" type="library">
-          <name>USART</name>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:sl_watchdog_timer" type="library">
+          <name>WDT</name>
           <version>3.5.2</version>
           <licenses>
             <expression>Zlib</expression>
@@ -148,6 +162,13 @@ referenced in this SBOM.)
             <expression>Zlib</expression>
           </licenses>
         </component>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:romdriver_ct" type="library">
+          <name>ROM DRIVER CT</name>
+          <version>3.5.2</version>
+          <licenses>
+            <expression>Zlib</expression>
+          </licenses>
+        </component>
         <component bom-ref="wiseconnect3_sdk:3.5.2:sl_si91x_common_flash_nvm3" type="library">
           <name>NVM3 Common Flash</name>
           <version>3.5.2</version>
@@ -160,6 +181,13 @@ referenced in this SBOM.)
           <version>3.5.2</version>
           <licenses>
             <expression>Apache-2.0 AND Zlib</expression>
+          </licenses>
+        </component>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:systemlevel_power_save" type="library">
+          <name>POWER SAVE</name>
+          <version>3.5.2</version>
+          <licenses>
+            <expression>Zlib</expression>
           </licenses>
         </component>
         <component bom-ref="wiseconnect3_sdk:3.5.2:cmsis_driver_headers" type="library">
@@ -241,6 +269,13 @@ referenced in this SBOM.)
         </component>
         <component bom-ref="wiseconnect3_sdk:3.5.2:rsilib_udma" type="library">
           <name>UDMA</name>
+          <version>3.5.2</version>
+          <licenses>
+            <expression>Zlib</expression>
+          </licenses>
+        </component>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:sl_gpio_peripheral" type="library">
+          <name>SL GPIO Peripheral</name>
           <version>3.5.2</version>
           <licenses>
             <expression>Zlib</expression>
@@ -515,6 +550,13 @@ referenced in this SBOM.)
             <expression>Zlib</expression>
           </licenses>
         </component>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:romdriver_power_save" type="library">
+          <name>ROM DRIVER POWER SAVE</name>
+          <version>3.5.2</version>
+          <licenses>
+            <expression>Zlib</expression>
+          </licenses>
+        </component>
         <component bom-ref="wiseconnect3_sdk:3.5.2:freertos_config" type="library">
           <name>SL SI91X FreeRTOS Configuration</name>
           <version>3.5.2</version>
@@ -573,6 +615,13 @@ referenced in this SBOM.)
         </component>
         <component bom-ref="wiseconnect3_sdk:3.5.2:romdriver_romtable" type="library">
           <name>ROM TABLE</name>
+          <version>3.5.2</version>
+          <licenses>
+            <expression>Zlib</expression>
+          </licenses>
+        </component>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:systemlevel_wwdt" type="library">
+          <name>WWDT</name>
           <version>3.5.2</version>
           <licenses>
             <expression>Zlib</expression>
@@ -683,29 +732,8 @@ referenced in this SBOM.)
             <expression>Zlib</expression>
           </licenses>
         </component>
-        <component bom-ref="wiseconnect3_sdk:3.5.2:sl_watchdog_timer" type="library">
-          <name>WDT</name>
-          <version>3.5.2</version>
-          <licenses>
-            <expression>Zlib</expression>
-          </licenses>
-        </component>
-        <component bom-ref="wiseconnect3_sdk:3.5.2:systemlevel_power_save" type="library">
-          <name>POWER SAVE</name>
-          <version>3.5.2</version>
-          <licenses>
-            <expression>Zlib</expression>
-          </licenses>
-        </component>
-        <component bom-ref="wiseconnect3_sdk:3.5.2:romdriver_power_save" type="library">
-          <name>ROM DRIVER POWER SAVE</name>
-          <version>3.5.2</version>
-          <licenses>
-            <expression>Zlib</expression>
-          </licenses>
-        </component>
-        <component bom-ref="wiseconnect3_sdk:3.5.2:systemlevel_wwdt" type="library">
-          <name>WWDT</name>
+        <component bom-ref="wiseconnect3_sdk:3.5.2:rsilib_ct" type="library">
+          <name>CT</name>
           <version>3.5.2</version>
           <licenses>
             <expression>Zlib</expression>

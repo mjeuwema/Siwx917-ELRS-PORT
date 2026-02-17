@@ -30,6 +30,25 @@ void lr1121_dio1_run_all_tests(void);
  */
 void lr1121_dio1_quick_test(void);
 
+/**
+ * @brief DIO1 Toggle Test
+ * 
+ * Tests the physical connection between LR1121 DIO1 and UULP_VBAT_GPIO_2 by:
+ * 1. Clearing IRQ and checking DIO1 goes LOW
+ * 2. Triggering an IRQ (RX timeout) and checking DIO1 goes HIGH
+ * 3. Clearing IRQ again and checking DIO1 goes LOW
+ * 
+ * @return 0 on success, -1 on failure
+ */
+int test_dio1_toggle(void);
+
+/**
+ * @brief Quick DIO1 state dump
+ * 
+ * Dumps current DIO1 pin level and LR1121 IRQ status for debugging.
+ */
+void test_dio1_state_dump(void);
+
 #ifdef __cplusplus
 }
 #endif

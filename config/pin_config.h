@@ -82,6 +82,39 @@
 // [ULP_I2S]$
 
 // $[SCT]
+// SCT IN0 on GPIO_25
+#ifndef SCT_IN0_PORT                            
+#define SCT_IN0_PORT                             HP
+#endif
+#ifndef SCT_IN0_PIN                             
+#define SCT_IN0_PIN                              25
+#endif
+#ifndef SCT_IN0_LOC                             
+#define SCT_IN0_LOC                              0
+#endif
+
+// SCT OUT0 on GPIO_29
+#ifndef SCT_OUT0_PORT                           
+#define SCT_OUT0_PORT                            HP
+#endif
+#ifndef SCT_OUT0_PIN                            
+#define SCT_OUT0_PIN                             29
+#endif
+#ifndef SCT_OUT0_LOC                            
+#define SCT_OUT0_LOC                             10
+#endif
+
+// SCT OUT1 on GPIO_30
+#ifndef SCT_OUT1_PORT                           
+#define SCT_OUT1_PORT                            HP
+#endif
+#ifndef SCT_OUT1_PIN                            
+#define SCT_OUT1_PIN                             30
+#endif
+#ifndef SCT_OUT1_LOC                            
+#define SCT_OUT1_LOC                             12
+#endif
+
 // [SCT]$
 
 // $[SIO]

@@ -40,6 +40,19 @@ wifi_http_otaf_soc/
 *.map
 *.axf
 
+# Large documentation PDFs (reference only)
+*.pdf
+
+# Ninja build files
+cmake_gcc/.ninja_deps
+cmake_gcc/.ninja_log
+cmake_gcc/build.ninja
+cmake_gcc/cmake_install.cmake
+
+# IDE/editor metadata
+.uceditor/
+.projectlinkstore
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -50,3 +63,14 @@ desktop.ini
 *_backup.h
 *.bak
 *.orig
+
+# Backup/trashed directories
+trashed_modified_files/
+src/old_c_code_backup/
+
+# Example/test directories not part of main project
+sl_si91x_gpio_uulp_example/
+sl_si91x_gpio_uulp_example_2/
+
+# Upstream ELRS reference clone (use upstream_elrs/ for selected reference files)
+ExpressLRS/

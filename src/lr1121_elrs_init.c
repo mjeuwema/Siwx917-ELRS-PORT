@@ -20,7 +20,9 @@
 
 #include "lr1121_elrs_init.h"
 #include "lr1121_driver.h"
-#include "elrs_protocol/lr1121_regs.h"  /* For LR1121_IRQ_TX_DONE, LR1121_IRQ_RX_DONE */
+/* IRQ constants moved inline - no longer need elrs_protocol header */
+#define LR1121_IRQ_TX_DONE 0x00000004
+#define LR1121_IRQ_RX_DONE 0x00000008
 #include "rsi_debug.h"
 #include <string.h>
 
@@ -34,6 +36,16 @@
 static void elrs_delay_ms(uint32_t ms) {
     for (uint32_t i = 0; i < ms; i++) {
         for (volatile uint32_t j = 0; j < 10000; j++) { }
+    }
+}
+
+/**
+ * @brief Simple delay in microseconds
+ */
+__attribute__((unused))
+static void elrs_delay_us(uint32_t us) {
+    for (uint32_t i = 0; i < us; i++) {
+        for (volatile uint32_t j = 0; j < 10; j++) { }
     }
 }
 
@@ -234,7 +246,9 @@ lr1121_status_t lr1121_elrs_init(uint32_t freq_min, uint32_t freq_max) {
     uint8_t tcxo_voltage = TCXO_ACTIVE_VOLTAGE;
     
     DEBUGOUT("[TCXO] Step 4: SetTcxoMode for EXTERNAL TCXO\n");
-    DEBUGOUT("[TCXO]   voltage=0x%02X (%s)\n", tcxo_voltage,
+    DEBUGOUT("[TCXO]   TCXO_ACTIVE_VOLTAGE define = 0x%02X\n", (unsigned int)TCXO_ACTIVE_VOLTAGE);
+    DEBUGOUT("[TCXO]   tcxo_voltage variable = 0x%02X\n", (unsigned int)tcxo_voltage);
+    DEBUGOUT("[TCXO]   voltage=0x%02X (%s)\n", (unsigned int)tcxo_voltage,
              tcxo_voltage == 0 ? "NONE - external TCXO" : "INTERNAL regulator");
     DEBUGOUT("[TCXO]   delay=0x%06lX (~%lums stabilization)\n",
              (unsigned long)tcxo_delay, 
@@ -438,14 +452,15 @@ lr1121_status_t lr1121_elrs_init(uint32_t freq_min, uint32_t freq_max) {
      * Citation: Waveshare Core1121_XF_Demo lr1121_common.c lines 78-87
      * =========================================================================
      */
-    DEBUGOUT("[TCXO] Step 11: SetDioAsRfSwitch (PE4259: DIO5=VDD, DIO6=CTRL)\n");
+    /* PE4259 Truth Table: V1=0,V2=1→TX, V1=1,V2=0→RX. DIO5→V1, DIO6→V2 */
+    DEBUGOUT("[TCXO] Step 11: SetDioAsRfSwitch (PE4259: RX=0x01, TX=0x02)\n");
     uint8_t rf_switch_params[8] = {
         0x03,  /* enable: DIO5+DIO6 */
-        0x01,  /* stbyCfg: DIO5=1 (power on), DIO6=0 */
-        0x03,  /* rxCfg: DIO5=1 (power), DIO6=1 (CTRL HIGH) → RF2 → RX */
-        0x01,  /* txCfg: DIO5=1 (power), DIO6=0 (CTRL LOW) → RF1 → TX */
-        0x01,  /* txHpCfg: DIO5=1 (power), DIO6=0 (CTRL LOW) → RF1 → TX */
-        0x00,  /* txHfCfg */
+        0x00,  /* stbyCfg: both off (switch isolated) */
+        0x01,  /* rxCfg: DIO5=1, DIO6=0 → V1=1, V2=0 → RF2 → RX */
+        0x02,  /* txCfg: DIO5=0, DIO6=1 → V1=0, V2=1 → RF1 → TX */
+        0x02,  /* txHpCfg: same as TX */
+        0x00,  /* txHfCfg: 2.4GHz uses RFIO_HF */
         0x00,  /* gnssCfg */
         0x00   /* wifiCfg */
     };
@@ -1053,17 +1068,20 @@ lr1121_status_t lr1121_bulletproof_tcxo_init(uint8_t tcxo_voltage) {
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
     
-    /* RF Switch config CORRECTED for PE4259 on Core1121-HF:
-     * DIO5 → VDD (power), DIO6 → CTRL (path select)
-     * CTRL LOW → RF1 (TX), CTRL HIGH → RF2 (RX)
+    /* PE4259 Truth Table (from Core1121-HF schematic):
+     *   V1=0, V2=1 → RFC to RF1 = TX path
+     *   V1=1, V2=0 → RFC to RF2 = RX path
+     * DIO5 → V1, DIO6 → V2
+     * RX: DIO5=1, DIO6=0 = 0x01
+     * TX: DIO5=0, DIO6=1 = 0x02
      */
     uint8_t rf_switch_params[8] = {
         0x03,  /* enable: DIO5+DIO6 */
-        0x01,  /* standby: DIO5=1 (power on), DIO6=0 */
-        0x03,  /* rx: DIO5=1 (power), DIO6=1 (CTRL HIGH) → RF2 → RX */
-        0x01,  /* tx: DIO5=1 (power), DIO6=0 (CTRL LOW) → RF1 → TX */
-        0x01,  /* tx_hp: DIO5=1 (power), DIO6=0 (CTRL LOW) → RF1 → TX */
-        0x00,  /* tx_hf */
+        0x00,  /* standby: both off (switch isolated) */
+        0x01,  /* rx: DIO5=1, DIO6=0 → V1=1, V2=0 → RF2 → RX */
+        0x02,  /* tx: DIO5=0, DIO6=1 → V1=0, V2=1 → RF1 → TX */
+        0x02,  /* tx_hp: same as tx */
+        0x00,  /* tx_hf: 2.4GHz uses RFIO_HF, no switch */
         0x00,  /* gnss */
         0x00   /* wifi */
     };
@@ -1431,411 +1449,309 @@ bool lr1121_verify_xosc_mode(uint8_t *chip_mode) {
 lr1121_status_t lr1121_waveshare_init(void) {
     
     DEBUGOUT("\n");
-    DEBUGOUT("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    DEBUGOUT("║  WAVESHARE EXACT INIT - lr1121_config.cpp lora_system_init()          ║\n");
-    DEBUGOUT("╠═══════════════════════════════════════════════════════════════════════╣\n");
-    DEBUGOUT("║  Citation: Core1121_XF_Demo/esp32s3/Arduino/.../lr1121_config.cpp     ║\n");
-    DEBUGOUT("╚═══════════════════════════════════════════════════════════════════════╝\n");
-    DEBUGOUT("\n");
+    DEBUGOUT("===============================================================\n");
+    DEBUGOUT("  TCXO INIT - MATCHING WORKING TEST SEQUENCE\n");
+    DEBUGOUT("===============================================================\n");
+    DEBUGOUT("  Order: Reset -> ClearErr -> RegMode(DCDC) -> SetTcxoMode ->\n");
+    DEBUGOUT("         (wait) -> SetStandby(XOSC) -> Calibrate ->\n");
+    DEBUGOUT("         SetStandby(XOSC) again\n");
+    DEBUGOUT("===============================================================\n\n");
     
     /* =========================================================================
      * STEP 1: Hardware Reset
-     * Citation: lr1121_config.cpp line 83: lr11xx_system_reset((void*)context)
      * =========================================================================
      */
-    DEBUGOUT("STEP 1: lr11xx_system_reset()\n");
+    DEBUGOUT("STEP 1: Hardware Reset\n");
     lr1121_status_t status = lr1121_reset();
     if (status != LR1121_OK) {
-        DEBUGOUT("  ✗ FAILED: Reset error %d\n", status);
+        DEBUGOUT("  X FAILED: Reset error %d\n", status);
         return status;
     }
-    DEBUGOUT("  ✓ Reset complete\n\n");
+    DEBUGOUT("  OK Reset complete\n\n");
     
     /* =========================================================================
-     * STEP 2: Wakeup
-     * Citation: lr1121_config.cpp line 84: lr11xx_hal_wakeup((void*)context)
+     * STEP 2: Clear Errors (clean slate)
      * =========================================================================
      */
-    DEBUGOUT("STEP 2: lr11xx_hal_wakeup()\n");
-    lr1121_cs_assert();
-    elrs_delay_ms(10);
-    lr1121_cs_deassert();
+    DEBUGOUT("STEP 2: ClearErrors [0x010E]\n");
+    lr1121_send_command(0x010E, NULL, 0);
+    lr1121_wait_busy_timeout(100);
     elrs_delay_ms(5);
-    
-    if (!lr1121_wait_busy_timeout(100)) {
-        DEBUGOUT("  ✗ FAILED: BUSY timeout after wakeup\n");
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    DEBUGOUT("  ✓ Wakeup complete\n\n");
+    DEBUGOUT("  OK Errors cleared\n\n");
     
     /* =========================================================================
-     * STEP 3: Disable SPI CRC
-     * Citation: lr1121_config.cpp line 91: lr11xx_system_enable_spi_crc(context, false)
-     * Opcode: 0x0128, Param: 0x00
+     * STEP 3: SetRegMode(DCDC)
      * =========================================================================
      */
-    DEBUGOUT("STEP 3: lr11xx_system_enable_spi_crc(false) [0x0128]\n");
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    uint8_t spi_crc = 0x00;
-    if (!lr1121_send_command(0x0128, &spi_crc, 1)) {
-        DEBUGOUT("  ✗ FAILED\n");
-        return LR1121_ERROR_SPI_INIT;
-    }
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    DEBUGOUT("  ✓ SPI CRC disabled\n\n");
-    
-    /* =========================================================================
-     * STEP 4: SetTcxoMode - MUST BE CALLED BEFORE SetStandby(XOSC)!
-     * 
-     * CRITICAL FIX (2026-01-25): Moved SetTcxoMode BEFORE SetStandby(XOSC)
-     * =====================================================================
-     * The original Waveshare demo order was wrong for proper initialization.
-     * You CANNOT call SetStandby(XOSC) before SetTcxoMode because:
-     *   1. SetStandby(XOSC) switches the system clock to the external oscillator
-     *   2. Without SetTcxoMode, the TCXO input mode isn't configured
-     *   3. The chip expects crystal circuit, not single-ended TCXO clock
-     *   4. Result: XOSC fails to start, chip stays in RC or falls to SLEEP
-     *
-     * Citation: lr1121_config.cpp line 108:
-     *   lr11xx_system_set_tcxo_mode(context, LR11XX_SYSTEM_TCXO_CTRL_3_0V, 300);
-     * Citation: lr11xx_system_types.h line 286:
-     *   LR11XX_SYSTEM_TCXO_CTRL_3_0V = 0x06
-     * Opcode: 0x0117, Params: [voltage, delay_msb, delay_mid, delay_lsb]
-     *   voltage = 0x06 (3.0V) - Per official Waveshare Core1121-XF demo
-     *   delay = 300 = 0x00012C
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 4: lr11xx_system_set_tcxo_mode(3.0V, 300) [0x0117] - BEFORE SetStandby!\n");
-    DEBUGOUT("  Voltage: 0x06 = 3.0V (per Waveshare Core1121-XF demo)\n");
-    DEBUGOUT("  Timeout: 300 steps × 30.52µs ≈ 9.15ms\n");
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    uint8_t tcxo_early[4] = {
-        0x06,  /* voltage: 3.0V - Per official Waveshare demo */
-        0x00,  /* delay MSB */
-        0x01,  /* delay MID */
-        0x2C   /* delay LSB - 0x12C = 300 */
-    };
-    if (!lr1121_send_command(0x0117, tcxo_early, 4)) {
-        DEBUGOUT("  ✗ FAILED\n");
-        return LR1121_ERROR_SPI_INIT;
-    }
-    DEBUGOUT("  Waiting for TCXO startup...\n");
-    if (!lr1121_wait_busy_timeout(500)) {
-        DEBUGOUT("  ✗ TCXO startup timeout\n");
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    DEBUGOUT("  ✓ SetTcxoMode complete\n\n");
-    
-    /* =========================================================================
-     * STEP 4b: SetStandby(XOSC) - NOW we can switch to XOSC (TCXO configured)
-     * Citation: lr1121_config.cpp line 94:
-     *   lr11xx_system_set_standby(context, LR11XX_SYSTEM_STANDBY_CFG_XOSC)
-     * Opcode: 0x011C, Param: 0x01 (XOSC)
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 4b: lr11xx_system_set_standby(XOSC) [0x011C, 0x01]\n");
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    uint8_t standby = 0x01;  /* XOSC */
-    if (!lr1121_send_command(0x011C, &standby, 1)) {
-        DEBUGOUT("  ✗ FAILED\n");
-        return LR1121_ERROR_SPI_INIT;
-    }
-    if (!lr1121_wait_busy_timeout(200)) {
-        DEBUGOUT("  ✗ BUSY timeout\n");
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    DEBUGOUT("  ✓ SetStandby(XOSC) complete\n\n");
-    
-    /* =========================================================================
-     * STEP 5: CalibrateImage for 430-440MHz (Waveshare default)
-     * Citation: lr1121_config.cpp line 96:
-     *   lr11xx_system_calibrate_image(context, 0x6B, 0x6E)
-     * Opcode: 0x0111, Params: [0x6B, 0x6E]
-     * 
-     * NOTE: For 915MHz use [0xE1, 0xE9], for 868MHz use [0xD7, 0xDB]
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 5: lr11xx_system_calibrate_image(0xE1, 0xE9) [0x0111] - 915MHz band\n");
-    DEBUGOUT("  Note: Waveshare uses 0x6B,0x6E for 433MHz. We use 0xE1,0xE9 for 915MHz\n");
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    uint8_t calib_img[2] = {0xE1, 0xE9};  /* 915MHz band (902-928 MHz) */
-    if (!lr1121_send_command(0x0111, calib_img, 2)) {
-        DEBUGOUT("  ✗ FAILED\n");
-        return LR1121_ERROR_SPI_INIT;
-    }
-    if (!lr1121_wait_busy_timeout(200)) {
-        DEBUGOUT("  ✗ BUSY timeout\n");
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    DEBUGOUT("  ✓ CalibrateImage complete\n\n");
-    
-    /* =========================================================================
-     * STEP 6: SetRegMode(DCDC)
-     * Citation: lr1121_config.cpp line 100-101:
-     *   const lr11xx_system_reg_mode_t regulator = smtc_shield_lr11xx_common_get_reg_mode();
-     *   lr11xx_system_set_reg_mode(context, regulator);
-     * Citation: lr1121_common.c line 726: returns LR11XX_SYSTEM_REG_MODE_DCDC (0x01)
-     * Opcode: 0x0110, Param: 0x01 (DCDC)
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 6: lr11xx_system_set_reg_mode(DCDC) [0x0110, 0x01]\n");
+    DEBUGOUT("STEP 3: SetRegMode(DCDC) [0x0110]\n");
     if (!lr1121_wait_busy_timeout(100)) {
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
     uint8_t reg_mode = 0x01;  /* DCDC */
     if (!lr1121_send_command(0x0110, &reg_mode, 1)) {
-        DEBUGOUT("  ✗ FAILED\n");
+        DEBUGOUT("  X FAILED\n");
         return LR1121_ERROR_SPI_INIT;
     }
     if (!lr1121_wait_busy_timeout(100)) {
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
-    DEBUGOUT("  ✓ SetRegMode(DCDC) complete\n\n");
+    elrs_delay_ms(5);
+    DEBUGOUT("  OK SetRegMode(DCDC) complete\n\n");
     
     /* =========================================================================
-     * STEP 7: SetDioAsRfSwitch
-     * Citation: lr1121_config.cpp line 104-105:
-     *   const lr11xx_system_rfswitch_cfg_t* rf_switch_setup = smtc_shield_lr11xx_common_get_rf_switch_cfg();
-     *   lr11xx_system_set_dio_as_rf_switch(context, rf_switch_setup);
-     * CORRECTED for PE4259 on Core1121-HF:
-     *   DIO5 → VDD (power), DIO6 → CTRL (path select)
-     *   CTRL LOW → RF1 (TX), CTRL HIGH → RF2 (RX)
-     * Opcode: 0x0112, Params: [8 bytes]
+     * STEP 4: SetTcxoMode - BEFORE SetStandby(XOSC)!
+     * This is the key difference from the previous sequences.
+     * 
+     * From working test: set_tcxo_mode(voltage, delay_ticks)
+     * Using voltage=0x06 (3.0V), delay=300 ticks (~9ms)
+     * 
+     * Then wait: software delay = hardware delay + 20ms margin
      * =========================================================================
      */
-    DEBUGOUT("STEP 7: lr11xx_system_set_dio_as_rf_switch() [0x0112]\n");
-    DEBUGOUT("  Config: enable=0x03, rx=0x03, tx=0x01 (DIO5=VDD, DIO6=CTRL)\n");
+    DEBUGOUT("STEP 4: SetTcxoMode(3.0V, 300 ticks) [0x0117]\n");
+    if (!lr1121_wait_busy_timeout(100)) {
+        return LR1121_ERROR_BUSY_TIMEOUT;
+    }
+    uint8_t tcxo_params[4] = {
+        0x06,  /* Voltage: 3.0V */
+        0x00,  /* Delay MSB */
+        0x01,  /* Delay middle byte */
+        0x2C   /* Delay LSB (300 = 0x012C) */
+    };
+    if (!lr1121_send_command(0x0117, tcxo_params, 4)) {
+        DEBUGOUT("  X FAILED\n");
+        return LR1121_ERROR_SPI_INIT;
+    }
+    if (!lr1121_wait_busy_timeout(100)) {
+        return LR1121_ERROR_BUSY_TIMEOUT;
+    }
+    DEBUGOUT("  OK SetTcxoMode command sent\n");
+    
+    /* CRITICAL: Wait for TCXO to stabilize!
+     * Software delay = (300 ticks * 31us/tick) / 1000 + 30ms margin = ~39ms
+     */
+    DEBUGOUT("  Waiting 40ms for TCXO stabilization...\n");
+    elrs_delay_ms(40);
+    DEBUGOUT("  OK TCXO wait complete\n\n");
+    
+    /* =========================================================================
+     * STEP 5: SetStandby(XOSC) - NOW switch to TCXO clock
+     * =========================================================================
+     */
+    DEBUGOUT("STEP 5: SetStandby(XOSC) [0x011C]\n");
+    if (!lr1121_wait_busy_timeout(100)) {
+        return LR1121_ERROR_BUSY_TIMEOUT;
+    }
+    uint8_t standby_xosc = 0x01;  /* XOSC */
+    if (!lr1121_send_command(0x011C, &standby_xosc, 1)) {
+        DEBUGOUT("  X FAILED\n");
+        return LR1121_ERROR_SPI_INIT;
+    }
+    elrs_delay_ms(20);
+    if (!lr1121_wait_busy_timeout(200)) {
+        DEBUGOUT("  X BUSY timeout\n");
+        return LR1121_ERROR_BUSY_TIMEOUT;
+    }
+    DEBUGOUT("  OK SetStandby(XOSC) complete\n");
+    
+    /* Check mode - should be STDBY_XOSC (2) */
+    uint8_t chip_mode = 0, cmd_status = 0;
+    uint16_t errors = 0;
+    if (lr1121_elrs_get_status(&chip_mode, &cmd_status, &errors)) {
+        DEBUGOUT("  Mode: %d (expect 2=STDBY_XOSC), Errors: 0x%04X\n", chip_mode, errors);
+        if (chip_mode != 2) {
+            DEBUGOUT("  WARNING: Not in STDBY_XOSC!\n");
+        }
+        if (errors & 0x0020) {
+            DEBUGOUT("  WARNING: HF_XOSC_START_ERR!\n");
+        }
+    }
+    DEBUGOUT("\n");
+    
+    /* =========================================================================
+     * STEP 6: Calibrate(0x3F)
+     * =========================================================================
+     */
+    DEBUGOUT("STEP 6: Calibrate(0x3F) [0x010F]\n");
+    if (!lr1121_wait_busy_timeout(100)) {
+        return LR1121_ERROR_BUSY_TIMEOUT;
+    }
+    uint8_t calib_mask = 0x3F;
+    if (!lr1121_send_command(0x010F, &calib_mask, 1)) {
+        DEBUGOUT("  X FAILED\n");
+        return LR1121_ERROR_SPI_INIT;
+    }
+    elrs_delay_ms(50);
+    if (!lr1121_wait_busy_timeout(500)) {
+        DEBUGOUT("  X BUSY timeout during calibration\n");
+        return LR1121_ERROR_BUSY_TIMEOUT;
+    }
+    DEBUGOUT("  OK Calibration complete\n\n");
+    
+    /* =========================================================================
+     * STEP 7: SetStandby(XOSC) AGAIN after calibration
+     * Calibration may put chip back in STDBY_RC, so re-issue this
+     * =========================================================================
+     */
+    DEBUGOUT("STEP 7: SetStandby(XOSC) again [0x011C]\n");
+    if (!lr1121_wait_busy_timeout(100)) {
+        return LR1121_ERROR_BUSY_TIMEOUT;
+    }
+    if (!lr1121_send_command(0x011C, &standby_xosc, 1)) {
+        DEBUGOUT("  X FAILED\n");
+        return LR1121_ERROR_SPI_INIT;
+    }
+    elrs_delay_ms(10);
+    if (!lr1121_wait_busy_timeout(100)) {
+        DEBUGOUT("  X BUSY timeout\n");
+        return LR1121_ERROR_BUSY_TIMEOUT;
+    }
+    DEBUGOUT("  OK SetStandby(XOSC) complete\n\n");
+    
+    /* =========================================================================
+     * STEP 8: Check errors after calibration
+     * =========================================================================
+     */
+    DEBUGOUT("STEP 8: Check errors\n");
+    chip_mode = 0; errors = 0;
+    if (lr1121_elrs_get_status(&chip_mode, &cmd_status, &errors)) {
+        DEBUGOUT("  Mode: %d, Errors: 0x%04X\n", chip_mode, errors);
+    }
+    DEBUGOUT("\n");
+    
+    /* =========================================================================
+     * STEP 9: SetDioAsRfSwitch (PE4259)
+     * =========================================================================
+     */
+    DEBUGOUT("STEP 9: SetDioAsRfSwitch [0x0112]\n");
     if (!lr1121_wait_busy_timeout(100)) {
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
     uint8_t rf_switch[8] = {
         0x03,  /* enable: DIO5+DIO6 */
-        0x01,  /* standby: DIO5=1 (power on), DIO6=0 */
-        0x03,  /* rx: DIO5=1 (power), DIO6=1 (CTRL HIGH) → RF2 → RX */
-        0x01,  /* tx: DIO5=1 (power), DIO6=0 (CTRL LOW) → RF1 → TX */
-        0x01,  /* tx_hp: DIO5=1 (power), DIO6=0 (CTRL LOW) → RF1 → TX */
+        0x00,  /* standby: both off */
+        0x01,  /* rx: DIO5=1, DIO6=0 */
+        0x02,  /* tx: DIO5=0, DIO6=1 */
+        0x02,  /* tx_hp: same as tx */
         0x00,  /* tx_hf */
         0x00,  /* gnss */
         0x00   /* wifi */
     };
     if (!lr1121_send_command(0x0112, rf_switch, 8)) {
-        DEBUGOUT("  ✗ FAILED\n");
+        DEBUGOUT("  X FAILED\n");
         return LR1121_ERROR_SPI_INIT;
     }
     if (!lr1121_wait_busy_timeout(100)) {
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
-    DEBUGOUT("  ✓ SetDioAsRfSwitch complete\n\n");
+    DEBUGOUT("  OK SetDioAsRfSwitch complete\n\n");
     
     /* =========================================================================
-     * STEP 8: SetTcxoMode - MOVED TO STEP 4 (BEFORE SetStandby)
-     * 
-     * This step is now executed early (before SetStandby(XOSC)) because:
-     *   - SetTcxoMode configures the TCXO input mode
-     *   - SetStandby(XOSC) switches the clock source to TCXO
-     *   - You can't switch to XOSC if TCXO isn't configured!
-     * 
-     * Citation: lr1121_config.cpp line 108:
-     *   lr11xx_system_set_tcxo_mode(context, LR11XX_SYSTEM_TCXO_CTRL_3_0V, 300);
+     * STEP 10: CalibrateImage for 915MHz band
      * =========================================================================
      */
-    DEBUGOUT("STEP 8: (SKIPPED - SetTcxoMode already done in STEP 4)\n\n");
-    
-    /* =========================================================================
-     * STEP 9: CfgLfClk - Low Frequency Clock Configuration
-     * 
-     * CRITICAL FIX (2026-01-16): Changed from XTAL to RC oscillator
-     * -------------------------------------------------------------
-     * Serial output showed: "BUSY timeout - possible missing 32kHz crystal?"
-     * Errors: PLL_LOCK_ERR and IMG_CALIB_ERR during calibration
-     * 
-     * Root cause: The Waveshare Core1121-HF module may NOT have the 32.768kHz
-     * crystal populated. Configuring for XTAL when no crystal exists causes
-     * the LR1121 state machine to hang waiting for a clock that never arrives.
-     *
-     * Fix: Use internal 32kHz RC oscillator instead
-     *   - RC mode: lfclk_cfg = 0x00 (LR11XX_SYSTEM_LFCLK_RC)
-     *   - wait_32k_ready = true (bit 2 = 0x04)
-     *   - Parameter = 0x00 | 0x04 = 0x04
-     *
-     * Citation: Semtech lr11xx_system.h - lr11xx_system_lfclk_cfg_t enum:
-     *   LR11XX_SYSTEM_LFCLK_RC   = 0x00  (Internal 32kHz RC oscillator)
-     *   LR11XX_SYSTEM_LFCLK_XTAL = 0x01  (External 32kHz crystal - NOT POPULATED!)
-     * Citation: Semtech lr11xx_system.c line 368:
-     *   cbuffer[2] = (uint8_t)(lfclock_cfg | (wait_for_32k_ready << 2))
-     *
-     * Opcode: 0x0116, Param: 0x04 (RC + wait)
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 9: lr11xx_system_cfg_lfclk(XTAL, true) [0x0116, 0x05]\n");
-    DEBUGOUT("  lfclk_cfg = 0x01 (XTAL - 32kHz crystal confirmed present)\n");
-    DEBUGOUT("  wait_32k_ready = true (bit 2)\n");
-    DEBUGOUT("  Parameter byte = 0x01 | (1<<2) = 0x05\n");
+    DEBUGOUT("STEP 10: CalibrateImage(915MHz) [0x0111]\n");
     if (!lr1121_wait_busy_timeout(100)) {
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
-    uint8_t lfclk = 0x05;  /* XTAL(0x01) | wait_32k_ready(bit2=0x04) = 0x05 */
-    if (!lr1121_send_command(0x0116, &lfclk, 1)) {
-        DEBUGOUT("  ✗ CfgLfClk FAILED\n");
+    uint8_t calib_img[2] = {0xE1, 0xE9};  /* 915MHz band */
+    if (!lr1121_send_command(0x0111, calib_img, 2)) {
+        DEBUGOUT("  X FAILED\n");
         return LR1121_ERROR_SPI_INIT;
     }
-    if (!lr1121_wait_busy_timeout(500)) {  /* Increased timeout for crystal startup */
-        DEBUGOUT("  ✗ BUSY timeout - 32kHz crystal may need more time or check connections\n");
+    elrs_delay_ms(10);
+    if (!lr1121_wait_busy_timeout(200)) {
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
-    DEBUGOUT("  ✓ CfgLfClk(XTAL) complete\n\n");
+    DEBUGOUT("  OK CalibrateImage complete\n\n");
     
     /* =========================================================================
-     * STEP 10: ClearErrors
-     * Citation: lr1121_config.cpp line 114: lr11xx_system_clear_errors(context)
-     * Opcode: 0x010E, Params: none
+     * STEP 11: Clear errors and IRQs
      * =========================================================================
      */
-    DEBUGOUT("STEP 10: lr11xx_system_clear_errors() [0x010E]\n");
+    DEBUGOUT("STEP 11: Clear errors and IRQs\n");
+    lr1121_send_command(0x010E, NULL, 0);  /* ClearErrors */
+    lr1121_wait_busy_timeout(100);
+    uint8_t irq_mask[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    lr1121_send_command(0x0114, irq_mask, 4);  /* ClearIrq */
+    lr1121_wait_busy_timeout(100);
+    DEBUGOUT("  OK Cleared\n\n");
+    
+    /* =========================================================================
+     * STEP 12: SetStandby(XOSC) - FINAL! After ALL calibrations
+     * 
+     * Per LR1121 docs: "At the end of the calibration procedure, the device
+     * returns to Standby RC." This applies to BOTH Calibrate() and CalibrateImage().
+     * 
+     * So we MUST issue SetStandby(XOSC) at the very end to switch back to TCXO.
+     * =========================================================================
+     */
+    DEBUGOUT("STEP 12: SetStandby(XOSC) - FINAL [0x011C]\n");
     if (!lr1121_wait_busy_timeout(100)) {
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
-    if (!lr1121_send_command(0x010E, NULL, 0)) {
-        DEBUGOUT("  ✗ FAILED\n");
+    uint8_t standby_final = 0x01;  /* XOSC */
+    if (!lr1121_send_command(0x011C, &standby_final, 1)) {
+        DEBUGOUT("  X FAILED\n");
         return LR1121_ERROR_SPI_INIT;
     }
-    if (!lr1121_wait_busy_timeout(100)) {
+    elrs_delay_ms(20);  /* Give TCXO time to start */
+    if (!lr1121_wait_busy_timeout(200)) {
+        DEBUGOUT("  X BUSY timeout\n");
         return LR1121_ERROR_BUSY_TIMEOUT;
     }
-    DEBUGOUT("  ✓ Errors cleared\n\n");
+    DEBUGOUT("  OK SetStandby(XOSC) complete\n\n");
     
     /* =========================================================================
-     * STEP 11: Calibrate(0x3F) - Full calibration
-     * Citation: lr1121_config.cpp line 116: lr11xx_system_calibrate(context, 0x3F)
-     * Opcode: 0x010F, Param: 0x3F
+     * STEP 13: Final status check
      * =========================================================================
      */
-    DEBUGOUT("STEP 11: lr11xx_system_calibrate(0x3F) [0x010F]\n");
-    DEBUGOUT("  Mask: 0x3F = All calibrations (LF_RC, HF_RC, PLL, ADC, IMG, PLL_TX)\n");
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    uint8_t calib = 0x3F;
-    if (!lr1121_send_command(0x010F, &calib, 1)) {
-        DEBUGOUT("  ✗ FAILED\n");
-        return LR1121_ERROR_SPI_INIT;
-    }
-    DEBUGOUT("  Waiting for calibration...\n");
-    if (!lr1121_wait_busy_timeout(500)) {
-        DEBUGOUT("  ✗ Calibration timeout\n");
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    DEBUGOUT("  ✓ Calibration complete\n\n");
+    DEBUGOUT("STEP 13: Final status check\n");
     
-    /* =========================================================================
-     * STEP 12: GetErrors and check for calibration issues
-     * Citation: lr1121_config.cpp lines 118-124
-     * Opcode: 0x010D
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 12: lr11xx_system_get_errors() [0x010D]\n");
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
+    /* Two-phase GetStatus */
+    lr1121_wait_busy_timeout(100);
+    lr1121_send_command(0x0100, NULL, 0);
+    lr1121_wait_busy_timeout(100);
+    uint8_t status_resp[6] = {0};
+    if (lr1121_read_response(status_resp, 6)) {
+        DEBUGOUT("  RAW GetStatus: [%02X %02X %02X %02X %02X %02X]\n",
+                 status_resp[0], status_resp[1], status_resp[2], 
+                 status_resp[3], status_resp[4], status_resp[5]);
+        
+        /* stat2 is in resp[1], chip mode in bits [3:1] */
+        uint8_t stat2 = status_resp[1];
+        chip_mode = (stat2 >> 1) & 0x07;
+        DEBUGOUT("  stat2=0x%02X -> chip_mode = %d\n", stat2, chip_mode);
+        DEBUGOUT("  Mode: %d (0=SLEEP, 1=STDBY_RC, 2=STDBY_XOSC)\n", chip_mode);
+        
+        if (chip_mode == 2) {
+            DEBUGOUT("  SUCCESS! LR1121 ready in STDBY_XOSC - TCXO working!\n");
+        } else if (chip_mode == 1) {
+            DEBUGOUT("  OK: Chip in STDBY_RC (usable)\n");
+        } else if (chip_mode == 0) {
+            DEBUGOUT("  Note: Chip in SLEEP (will wake on next command)\n");
+        }
     }
     
+    /* Check errors */
+    lr1121_wait_busy_timeout(100);
+    lr1121_send_command(0x010D, NULL, 0);
+    lr1121_wait_busy_timeout(100);
     uint8_t err_resp[3] = {0};
-    if (!elrs_cmd(0x010D, NULL, 0, err_resp, 3)) {
-        DEBUGOUT("  ✗ FAILED to read errors\n");
-    } else {
-        uint16_t errors = ((uint16_t)err_resp[1] << 8) | err_resp[2];
+    if (lr1121_read_response(err_resp, 3)) {
+        errors = ((uint16_t)err_resp[1] << 8) | err_resp[2];
         DEBUGOUT("  Errors: 0x%04X\n", errors);
-        if (errors & 0x0010) {
-            DEBUGOUT("  ⚠️  IMG_CALIB_ERR detected\n");
-        }
-        if (errors & 0x0008) {
-            DEBUGOUT("  ⚠️  PLL_CALIB_ERR detected\n");
-        }
-        if (errors & 0x0080) {
-            DEBUGOUT("  ⚠️  PLL_LOCK_ERR detected\n");
-        }
         if (errors == 0) {
-            DEBUGOUT("  ✓ No errors\n");
+            DEBUGOUT("  No errors - initialization successful!\n");
         }
+        if (errors & 0x0020) DEBUGOUT("  WARNING: HF_XOSC_START_ERR\n");
+        if (errors & 0x0080) DEBUGOUT("  WARNING: PLL_LOCK_ERR\n");
     }
     DEBUGOUT("\n");
     
-    /* =========================================================================
-     * STEP 13: ClearErrors (again)
-     * Citation: lr1121_config.cpp line 126: lr11xx_system_clear_errors(context)
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 13: lr11xx_system_clear_errors() [0x010E]\n");
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    if (!lr1121_send_command(0x010E, NULL, 0)) {
-        DEBUGOUT("  ✗ FAILED\n");
-        return LR1121_ERROR_SPI_INIT;
-    }
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    DEBUGOUT("  ✓ Errors cleared\n\n");
-    
-    /* =========================================================================
-     * STEP 14: ClearIrqStatus
-     * Citation: lr1121_config.cpp line 129:
-     *   lr11xx_system_clear_irq_status(context, LR11XX_SYSTEM_IRQ_ALL_MASK)
-     * Opcode: 0x0114, Params: [4 bytes, all 0xFF]
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 14: lr11xx_system_clear_irq_status(ALL) [0x0114]\n");
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    uint8_t irq_clear[4] = {0xFF, 0xFF, 0xFF, 0xFF};  /* Clear all IRQs */
-    if (!lr1121_send_command(0x0114, irq_clear, 4)) {
-        DEBUGOUT("  ✗ FAILED\n");
-        return LR1121_ERROR_SPI_INIT;
-    }
-    if (!lr1121_wait_busy_timeout(100)) {
-        return LR1121_ERROR_BUSY_TIMEOUT;
-    }
-    DEBUGOUT("  ✓ IRQs cleared\n\n");
-    
-    /* =========================================================================
-     * STEP 15: Verify chip status
-     * =========================================================================
-     */
-    DEBUGOUT("STEP 15: Verify chip status\n");
-    uint8_t chip_mode = 0xFF;
-    if (lr1121_verify_xosc_mode(&chip_mode)) {
-        DEBUGOUT("  ✓ Chip Mode: %d (STDBY_XOSC)\n", chip_mode);
-    } else {
-        DEBUGOUT("  Chip Mode: %d\n", chip_mode);
-        if (chip_mode == 1) {
-            DEBUGOUT("  ⚠️  Still in STDBY_RC (XOSC not active)\n");
-        }
-    }
-    
-    /* =========================================================================
-     * SUCCESS!
-     * =========================================================================
-     */
-    DEBUGOUT("\n");
-    DEBUGOUT("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    DEBUGOUT("║  ✓ WAVESHARE INIT COMPLETE!                                           ║\n");
-    DEBUGOUT("║  - Exact sequence from lr1121_config.cpp lora_system_init()           ║\n");
-    DEBUGOUT("║  - TCXO: 3.0V, 300 tick timeout                                        ║\n");
-    DEBUGOUT("║  - LF Clock: XTAL mode (32kHz crystal)                                 ║\n");
-    DEBUGOUT("║  - Full calibration (0x3F) complete                                    ║\n");
-    DEBUGOUT("╚═══════════════════════════════════════════════════════════════════════╝\n");
-    DEBUGOUT("\n");
+    DEBUGOUT("===============================================================\n");
+    DEBUGOUT("  WAVESHARE INIT COMPLETE\n");
+    DEBUGOUT("===============================================================\n\n");
     
     return LR1121_OK;
 }
