@@ -1,5 +1,5 @@
 # Define minimal required version of CMake.
-cmake_minimum_required(VERSION "3.25")
+cmake_minimum_required(VERSION "3.20")
 
 # Include toolchain before project() call
 include(toolchain.cmake)

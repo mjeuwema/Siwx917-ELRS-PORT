@@ -11,6 +11,7 @@
 #include "LR1121Driver.h"
 #include "LR1121_Regs.h"
 #include "crsf_protocol.h"
+#include "options.h"
 
 // Global Radio instance
 LR1121Driver Radio;
@@ -145,6 +146,19 @@ bool isSupportedRFRate(uint8_t index)
     if (!isDualRadio() && ModParams->radio_type == RADIO_TYPE_LR1121_LORA_DUAL)
     {
         return false;
+    }
+
+    // For 900MHz domain (FCC915, AU915, EU868, etc.), skip 2.4GHz-only rates
+    // For 2.4GHz domain, skip 900MHz-only rates
+    // This ensures RX scans the correct band for the configured domain
+    if (firmwareOptions.domain <= 7) // 900MHz domains (AU915, FCC915, EU868, IN866, AU433, EU433, US433, US433W)
+    {
+        // Skip 2.4GHz-only rates (9-17)
+        if (ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_2G4 ||
+            ModParams->radio_type == RADIO_TYPE_LR1121_LORA_2G4)
+        {
+            return false;
+        }
     }
 
     return true;

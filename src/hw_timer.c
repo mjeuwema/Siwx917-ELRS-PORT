@@ -107,9 +107,9 @@ typedef struct {
 
   /* State tracking */
   volatile bool is_initialized; /**< Timer hardware initialized */
-  volatile bool is_tock;    /**< true = TOCK (end), false = TICK (mid) */
-  volatile bool is_running; /**< Timer currently running */
-  volatile bool is_paused;  /**< Timer paused (connection loss) */
+  volatile bool is_tock;        /**< true = TOCK (end), false = TICK (mid) */
+  volatile bool is_running;     /**< Timer currently running */
+  volatile bool is_paused;      /**< Timer paused (connection loss) */
 
   /* Callbacks */
   hw_timer_tick_callback_t tick_callback;
@@ -450,7 +450,23 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   /* Clear any pending CT interrupt before registering callback */
   printf("hw_timer: [6/7] Clearing pending CT IRQ...\n");
   NVIC_ClearPendingIRQ(CT_IRQn);
-  printf("hw_timer: [6/7] DONE\n");
+
+  /* Set CT interrupt to moderate priority (5) for ELRS timing accuracy
+   *
+   * CRITICAL: Do NOT set this to 0 (highest)!
+   * The UDMA (DMA) completion interrupt must be able to fire during/after SPI
+   * transfers to clear the GSPI driver's internal busy flag. If the CT ISR is
+   * at priority 0, it preempts UDMA IRQ, preventing the DMA completion
+   * callback from firing, which causes SPI transfers to return
+   * ARM_DRIVER_ERROR_BUSY (SL_STATUS_BUSY 0x0004) on all subsequent calls.
+   *
+   * Priority 5 provides good timing (~±5µs jitter) while allowing DMA to
+   * complete. The hw_timer_pause_isr() guard in cs_assert() protects against
+   * CT firing DURING an SPI transfer, but priority must still allow UDMA IRQ
+   * to fire BETWEEN SPI transfers to clear the busy state.
+   */
+  NVIC_SetPriority(CT_IRQn, 5);
+  printf("hw_timer: [6/7] DONE (priority=5, below DMA)\n");
 
   /* Unregister any existing callback first (in case of re-init) */
   printf("hw_timer: [7/7] Unregistering existing callback (if any)...\n");
@@ -470,6 +486,25 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   }
 
   return status;
+}
+
+/**
+ * @brief Pause the CT hardware timer ISR
+ * Called by the SPI driver to prevent SPI reentrancy
+ */
+void hw_timer_pause_isr(void) {
+  if (hw_timer.is_initialized) {
+    NVIC_DisableIRQ(CT_IRQn);
+  }
+}
+
+/**
+ * @brief Resume the CT hardware timer ISR
+ */
+void hw_timer_resume_isr(void) {
+  if (hw_timer.is_initialized && hw_timer.is_running && !hw_timer.is_paused) {
+    NVIC_EnableIRQ(CT_IRQn);
+  }
 }
 
 /**

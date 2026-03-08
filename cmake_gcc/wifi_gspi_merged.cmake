@@ -129,6 +129,7 @@ add_library(slc OBJECT
     "../src/external_tcxo_test.c"
     "../src/gspi_example.c"
     "../src/lr1121_dio1_test.c"
+    "../src/dio1_hp_gpio_test.c"
     "../src/lr1121_driver.c"
     "../src/lr1121_elrs_init.c"
     "../src/elrs_config.c"
@@ -141,6 +142,7 @@ add_library(slc OBJECT
     "../src/tcxo_diagnostic.c"
     "../src/wifi_http_test.c"
     "../src/lr1121_tcxo_test.c"
+    "../src/lr1121_rx_test.c"
 )
 
 target_include_directories(slc PUBLIC
@@ -234,7 +236,6 @@ target_compile_definitions(slc PUBLIC
     "UDMA_ROMDRIVER_PRESENT=1"
     "GSPI_CONFIG=1"
     "GSPI_MULTI_SLAVE=1"
-    "SL_SI91X_GSPI_DMA=1"
     "FLASH_PAGE_SIZE=4096"
     "SLI_SI91X_OFFLOAD_NETWORK_STACK=1"
     "SI917=1"

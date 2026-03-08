@@ -33,15 +33,15 @@
  */
 
 #include "lr1121_driver.h"
+
 #include "rsi_debug.h"
 #include "rsi_egpio.h"
 #include "rsi_rom_egpio.h"
 #include "sl_si91x_gspi.h"
-#include "core_cm4.h"  /* For __DSB() memory barrier */
 
 /* SDK GPIO driver for UULP GPIO interrupt support */
-#include "sl_si91x_driver_gpio.h"
 #include "sl_gpio_board.h"
+#include "sl_si91x_driver_gpio.h"
 
 /* SL_STATUS_EMPTY may not be defined in older SDK versions
  * It's used by GSPI when DMA completes but FIFO appears empty
@@ -51,14 +51,16 @@
 #endif
 
 /* USE_SOFT_SPI: Bit-bang SPI implementation
- * 
+ *
  * Uncomment to use software bit-bang SPI (slower but proven to work).
  * Comment out to use hardware GSPI with DMA (faster, required for ELRS).
  */
 // #define USE_SOFT_SPI
 
-#include <string.h>
 #include <stdbool.h>
+#include <string.h>
+
+#include "hw_timer.h" // Prevent SPI pre-emption
 
 /* Soft SPI function removed - Logic inlined in spi_transfer */
 
@@ -96,27 +98,27 @@
  * IMPORTANT: Both clocks are DISABLED at reset! Must enable before GPIO works.
  ******************************************************************************/
 #define M4CLK_BASE 0x46000000UL
-#define CLK_ENABLE_SET_REG2  (*(volatile uint32_t *)(M4CLK_BASE + 0x008))
-#define CLK_ENABLE_SET_REG3  (*(volatile uint32_t *)(M4CLK_BASE + 0x010))
-#define EGPIO_PCLK_ENABLE_BIT  (1UL << 21)  /* CLK_ENABLE_SET_REG2 bit 21 */
-#define EGPIO_CLK_ENABLE_BIT   (1UL << 16)  /* CLK_ENABLE_SET_REG3 bit 16 */
+#define CLK_ENABLE_SET_REG2 (*(volatile uint32_t *)(M4CLK_BASE + 0x008))
+#define CLK_ENABLE_SET_REG3 (*(volatile uint32_t *)(M4CLK_BASE + 0x010))
+#define EGPIO_PCLK_ENABLE_BIT (1UL << 21) /* CLK_ENABLE_SET_REG2 bit 21 */
+#define EGPIO_CLK_ENABLE_BIT (1UL << 16)  /* CLK_ENABLE_SET_REG3 bit 16 */
 
 /* HOST_PADS_GPIO_MODE bit positions for GPIO_26-30
- * Citation: siw917x-family-rm.pdf Rev 1.2, Section 24.5.15 MCR_GENERIC_CTRL_1_REG, p.612
- *   Bits 18:14 - HOST_PADS_GPIO_MODE
- *   "Control bits for GPIO_26 to GPIO_30 to use either as host interface pins or GPIO pins."
+ * Citation: siw917x-family-rm.pdf Rev 1.2, Section 24.5.15
+ * MCR_GENERIC_CTRL_1_REG, p.612 Bits 18:14 - HOST_PADS_GPIO_MODE "Control bits
+ * for GPIO_26 to GPIO_30 to use either as host interface pins or GPIO pins."
  *   "One bit per pin. 0 = Host Interface, 1 = GPIO."
  *
- * CRITICAL: At reset, these bits are 0 (Host Interface / SDIO mode), NOT GPIO mode!
- * We MUST set these bits to 1 to use the pins as GPIO!
+ * CRITICAL: At reset, these bits are 0 (Host Interface / SDIO mode), NOT GPIO
+ * mode! We MUST set these bits to 1 to use the pins as GPIO!
  */
-#define HOST_PADS_GPIO26_BIT (1UL << 14)  /* GPIO_26 (MISO) */
-#define HOST_PADS_GPIO27_BIT (1UL << 15)  /* GPIO_27 (MOSI) */
-#define HOST_PADS_GPIO28_BIT (1UL << 16)  /* GPIO_28 (CS) */
-#define HOST_PADS_GPIO29_BIT (1UL << 17)  /* GPIO_29 (BUSY) */
-#define HOST_PADS_GPIO30_BIT (1UL << 18)  /* GPIO_30 (RST) */
-#define HOST_PADS_GPIO_MODE_ALL \
-  (HOST_PADS_GPIO26_BIT | HOST_PADS_GPIO27_BIT | HOST_PADS_GPIO28_BIT | \
+#define HOST_PADS_GPIO26_BIT (1UL << 14) /* GPIO_26 (MISO) */
+#define HOST_PADS_GPIO27_BIT (1UL << 15) /* GPIO_27 (MOSI) */
+#define HOST_PADS_GPIO28_BIT (1UL << 16) /* GPIO_28 (CS) */
+#define HOST_PADS_GPIO29_BIT (1UL << 17) /* GPIO_29 (BUSY) */
+#define HOST_PADS_GPIO30_BIT (1UL << 18) /* GPIO_30 (RST) */
+#define HOST_PADS_GPIO_MODE_ALL                                                \
+  (HOST_PADS_GPIO26_BIT | HOST_PADS_GPIO27_BIT | HOST_PADS_GPIO28_BIT |        \
    HOST_PADS_GPIO29_BIT | HOST_PADS_GPIO30_BIT)
 
 /* HP GPIO Direct Register Access (Pins 25-30)
@@ -126,9 +128,8 @@
  * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.11, p.320
  *   "Base address for EGPIO instance: 0x4613_0000"
  *
- * Citation: siw917x-family-rm.pdf Rev 1.2, Table 11.4 "EGPIO Port Register Mapping", p.292
- *   EGPIO PORT 1 (SL_GPIO_PORT_B) bit mapping:
- *     Bit 15 = GPIO_31
+ * Citation: siw917x-family-rm.pdf Rev 1.2, Table 11.4 "EGPIO Port Register
+ * Mapping", p.292 EGPIO PORT 1 (SL_GPIO_PORT_B) bit mapping: Bit 15 = GPIO_31
  *     Bit 14 = GPIO_30  (RST)
  *     Bit 13 = GPIO_29  (BUSY)
  *     Bit 12 = GPIO_28  (CS)
@@ -153,25 +154,31 @@
  *
  * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.11, p.320
  */
-#define EGPIO_GPIO_CONFIG_REG(pin) (*(volatile uint32_t *)(EGPIO_BASE + (0x10 * (pin))))
+#define EGPIO_GPIO_CONFIG_REG(pin)                                             \
+  (*(volatile uint32_t *)(EGPIO_BASE + (0x10 * (pin))))
 
 /* Per-Pin BIT_LOAD_REG for individual pin read/write
  * Offset = 0x004 + (0x10 * pin_number)
  *
- * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.12.2 BIT_LOAD_REG_x, p.323
- *   "Reading BIT_LOAD reads the logic level present at the pin."
- *   "Sets pin value on write."
+ * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.12.2 BIT_LOAD_REG_x,
+ * p.323 "Reading BIT_LOAD reads the logic level present at the pin." "Sets pin
+ * value on write."
  */
-#define EGPIO_BIT_LOAD_REG(pin) (*(volatile uint32_t *)(EGPIO_BASE + 0x004 + (0x10 * (pin))))
+#define EGPIO_BIT_LOAD_REG(pin)                                                \
+  (*(volatile uint32_t *)(EGPIO_BASE + 0x004 + (0x10 * (pin))))
 
 /* PORT 1 registers for GPIO_25-30
  * Port 1 base offset = 0x1000 + (0x40 * 1) = 0x1040
  */
 #define EGPIO_PORT1_BASE (EGPIO_BASE + 0x1040)
-#define EGPIO_PORT1_LOAD_REG   (*(volatile uint32_t *)(EGPIO_PORT1_BASE + 0x00))  /* 0x1040 */
-#define EGPIO_PORT1_SET_REG    (*(volatile uint32_t *)(EGPIO_PORT1_BASE + 0x04))  /* 0x1044 */
-#define EGPIO_PORT1_CLR_REG    (*(volatile uint32_t *)(EGPIO_PORT1_BASE + 0x08))  /* 0x1048 */
-#define EGPIO_PORT1_READ_REG   (*(volatile uint32_t *)(EGPIO_PORT1_BASE + 0x14))  /* 0x1054 */
+#define EGPIO_PORT1_LOAD_REG                                                   \
+  (*(volatile uint32_t *)(EGPIO_PORT1_BASE + 0x00)) /* 0x1040 */
+#define EGPIO_PORT1_SET_REG                                                    \
+  (*(volatile uint32_t *)(EGPIO_PORT1_BASE + 0x04)) /* 0x1044 */
+#define EGPIO_PORT1_CLR_REG                                                    \
+  (*(volatile uint32_t *)(EGPIO_PORT1_BASE + 0x08)) /* 0x1048 */
+#define EGPIO_PORT1_READ_REG                                                   \
+  (*(volatile uint32_t *)(EGPIO_PORT1_BASE + 0x14)) /* 0x1054 */
 
 /* Bit position in PORT 1 for each GPIO pin
  * GPIO_25 = bit 9, GPIO_26 = bit 10, ..., GPIO_30 = bit 14
@@ -179,24 +186,28 @@
 #define HP_GPIO_PORT1_BIT(pin) (1UL << ((pin) - 25 + 9))
 
 /* Direction control via per-pin GPIO_CONFIG_REG */
-#define HP_GPIO_SET_OUTPUT(pin) (EGPIO_GPIO_CONFIG_REG(pin) &= ~(1UL << 0))  /* DIRECTION=0 */
-#define HP_GPIO_SET_INPUT(pin)  (EGPIO_GPIO_CONFIG_REG(pin) |=  (1UL << 0))  /* DIRECTION=1 */
+#define HP_GPIO_SET_OUTPUT(pin)                                                \
+  (EGPIO_GPIO_CONFIG_REG(pin) &= ~(1UL << 0)) /* DIRECTION=0 */
+#define HP_GPIO_SET_INPUT(pin)                                                 \
+  (EGPIO_GPIO_CONFIG_REG(pin) |= (1UL << 0)) /* DIRECTION=1 */
 
-/* Output control via PORT 1 SET/CLR registers (ORIGINAL - keeping for reference)
- * #define HP_GPIO_SET_HIGH(pin) (EGPIO_PORT1_SET_REG = HP_GPIO_PORT1_BIT(pin))
- * #define HP_GPIO_SET_LOW(pin)  (EGPIO_PORT1_CLR_REG = HP_GPIO_PORT1_BIT(pin))
+/* Output control via PORT 1 SET/CLR registers (ORIGINAL - keeping for
+ * reference) #define HP_GPIO_SET_HIGH(pin) (EGPIO_PORT1_SET_REG =
+ * HP_GPIO_PORT1_BIT(pin)) #define HP_GPIO_SET_LOW(pin)  (EGPIO_PORT1_CLR_REG =
+ * HP_GPIO_PORT1_BIT(pin))
  */
 
 /* Output control via BIT_LOAD_REG (per-pin register - RECOMMENDED by datasheet)
- * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.12.2 BIT_LOAD_REG_x, p.323
- *   "Writing BIT_LOAD will set or clear the pin output."
- *   "Reading BIT_LOAD reads the logic level present at the pin."
- * 
+ * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.12.2 BIT_LOAD_REG_x,
+ * p.323 "Writing BIT_LOAD will set or clear the pin output." "Reading BIT_LOAD
+ * reads the logic level present at the pin."
+ *
  * This method directly writes to the individual pin's register instead of
- * using the PORT-wide SET/CLR registers, which may have additional requirements.
+ * using the PORT-wide SET/CLR registers, which may have additional
+ * requirements.
  */
 #define HP_GPIO_SET_HIGH(pin) (EGPIO_BIT_LOAD_REG(pin) = 1)
-#define HP_GPIO_SET_LOW(pin)  (EGPIO_BIT_LOAD_REG(pin) = 0)
+#define HP_GPIO_SET_LOW(pin) (EGPIO_BIT_LOAD_REG(pin) = 0)
 
 /* Input read via BIT_LOAD_REG (individual pin read - recommended method)
  * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.12.2, p.323
@@ -286,54 +297,67 @@ static void configure_gpio_pads(void) {
    *   Reset value = 0x0 (DISABLED!) - Must enable for GPIO to work!
    ******************************************************************************/
   DEBUGOUT("Enabling EGPIO clocks (CRITICAL - disabled at reset!)...\n");
-  DEBUGOUT("  CLK_ENABLE_SET_REG2 BEFORE: 0x%08lX\n", (unsigned long)CLK_ENABLE_SET_REG2);
-  DEBUGOUT("  CLK_ENABLE_SET_REG3 BEFORE: 0x%08lX\n", (unsigned long)CLK_ENABLE_SET_REG3);
-  
-  CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT;  /* Enable EGPIO APB clock */
-  CLK_ENABLE_SET_REG3 = EGPIO_CLK_ENABLE_BIT;   /* Enable EGPIO controller clock */
-  
+  DEBUGOUT("  CLK_ENABLE_SET_REG2 BEFORE: 0x%08lX\n",
+           (unsigned long)CLK_ENABLE_SET_REG2);
+  DEBUGOUT("  CLK_ENABLE_SET_REG3 BEFORE: 0x%08lX\n",
+           (unsigned long)CLK_ENABLE_SET_REG3);
+
+  CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT; /* Enable EGPIO APB clock */
+  CLK_ENABLE_SET_REG3 =
+      EGPIO_CLK_ENABLE_BIT; /* Enable EGPIO controller clock */
+
   /* Wait for clocks to stabilize */
-  for (volatile int i = 0; i < 1000; i++) { }
-  
-  DEBUGOUT("  CLK_ENABLE_SET_REG2 AFTER:  0x%08lX (expect bit21=1)\n", (unsigned long)CLK_ENABLE_SET_REG2);
-  DEBUGOUT("  CLK_ENABLE_SET_REG3 AFTER:  0x%08lX (expect bit16=1)\n", (unsigned long)CLK_ENABLE_SET_REG3);
+  for (volatile int i = 0; i < 1000; i++) {
+  }
+
+  DEBUGOUT("  CLK_ENABLE_SET_REG2 AFTER:  0x%08lX (expect bit21=1)\n",
+           (unsigned long)CLK_ENABLE_SET_REG2);
+  DEBUGOUT("  CLK_ENABLE_SET_REG3 AFTER:  0x%08lX (expect bit16=1)\n",
+           (unsigned long)CLK_ENABLE_SET_REG3);
 
   /* Step 1: Take MCU control of GPIO_25-30 from NWP
    * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.4.1, p.309
-   * MEM_GPIO_ACCESS_CTRL_SET at 0x4130_0000: Write bit 5 = 1 to enable MCU control
+   * MEM_GPIO_ACCESS_CTRL_SET at 0x4130_0000: Write bit 5 = 1 to enable MCU
+   * control
    */
   MEM_GPIO_ACCESS_CTRL_SET = NWP_MCUHP_GPIO_CTRL2_BIT;
-  for (volatile int i = 0; i < 100; i++) { }
+  for (volatile int i = 0; i < 100; i++) {
+  }
   DEBUGOUT("Step 1: MEM_GPIO_ACCESS_CTRL_SET = MCU control of GPIO_25-30\n");
 
-  /* Step 2: CRITICAL - Enable GPIO mode for GPIO_26-30 via MCR_GENERIC_CTRL_1_REG
+  /* Step 2: CRITICAL - Enable GPIO mode for GPIO_26-30 via
+   * MCR_GENERIC_CTRL_1_REG
    *
    * Citation: siw917x-family-rm.pdf Rev 1.2, Section 24.5.15, p.612
    *   MCR_GENERIC_CTRL_1_REG at 0x46008044
    *   Bits 18:14 - HOST_PADS_GPIO_MODE
-   *   "Control bits for GPIO_26 to GPIO_30 to use either as host interface pins or GPIO pins."
-   *   "One bit per pin. 0 = Host Interface, 1 = GPIO."
+   *   "Control bits for GPIO_26 to GPIO_30 to use either as host interface pins
+   * or GPIO pins." "One bit per pin. 0 = Host Interface, 1 = GPIO."
    *
    * Citation: siw917x-family-rm.pdf Rev 1.2, Section 11.2.5.1, p.294
-   *   "Note: To use GPIO_26 through GPIO_30 as GPIO or route to peripherals, 
-   *    the corresponding bits in MCR_GENERIC_CTRL_1_REG.HOST_PADS_GPIO_MODE 
+   *   "Note: To use GPIO_26 through GPIO_30 as GPIO or route to peripherals,
+   *    the corresponding bits in MCR_GENERIC_CTRL_1_REG.HOST_PADS_GPIO_MODE
    *    field must be configured for GPIO mode."
    *
    * At reset, bits 14-18 are ALL ZERO = Host Interface (SDIO) mode
-   * We MUST set them to 1 for GPIO mode - THIS IS THE ROOT CAUSE OF GPIO NOT WORKING!
+   * We MUST set them to 1 for GPIO mode - THIS IS THE ROOT CAUSE OF GPIO NOT
+   * WORKING!
    */
-  DEBUGOUT("Step 2: MCR_GENERIC_CTRL_1_REG - Enable GPIO mode for GPIO_26-30\n");
-  DEBUGOUT("  MCR_GENERIC_CTRL_1 BEFORE: 0x%08lX\n", 
+  DEBUGOUT(
+      "Step 2: MCR_GENERIC_CTRL_1_REG - Enable GPIO mode for GPIO_26-30\n");
+  DEBUGOUT("  MCR_GENERIC_CTRL_1 BEFORE: 0x%08lX\n",
            (unsigned long)MCR_GENERIC_CTRL_1_REG);
-  
+
   /* Set bits 14-18 to enable GPIO mode for GPIO_26-30 */
   MCR_GENERIC_CTRL_1_REG |= HOST_PADS_GPIO_MODE_ALL;
-  for (volatile int i = 0; i < 100; i++) { }
-  
-  DEBUGOUT("  MCR_GENERIC_CTRL_1 AFTER:  0x%08lX (expect bits 14-18 = 1)\n", 
+  for (volatile int i = 0; i < 100; i++) {
+  }
+
+  DEBUGOUT("  MCR_GENERIC_CTRL_1 AFTER:  0x%08lX (expect bits 14-18 = 1)\n",
            (unsigned long)MCR_GENERIC_CTRL_1_REG);
-  DEBUGOUT("  Verify: HOST_PADS_GPIO_MODE = 0x%lX (should be 0x1F for all 5 pins)\n",
-           (unsigned long)((MCR_GENERIC_CTRL_1_REG >> 14) & 0x1F));
+  DEBUGOUT(
+      "  Verify: HOST_PADS_GPIO_MODE = 0x%lX (should be 0x1F for all 5 pins)\n",
+      (unsigned long)((MCR_GENERIC_CTRL_1_REG >> 14) & 0x1F));
 
   /* Enable receiver on GPIO_26 (MISO) - CRITICAL for reads
    * Citation: siw917x-family-rm.pdf Section 11.6.1
@@ -341,19 +365,19 @@ static void configure_gpio_pads(void) {
    *   Bit 4 (REN): Receiver Enable - MUST be 1 for input
    *   Bit 3 (SMT): Schmitt Trigger - improves noise immunity
    */
-  DEBUGOUT("  PAD_CONFIG_REG(26) BEFORE = 0x%08lX\n", 
+  DEBUGOUT("  PAD_CONFIG_REG(26) BEFORE = 0x%08lX\n",
            (unsigned long)PAD_CONFIG_REG(26));
   PAD_CONFIG_REG(26) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
   for (volatile int i = 0; i < 100; i++) {
   }
-  DEBUGOUT("  PAD_CONFIG_REG(26) AFTER  = 0x%08lX\n", 
+  DEBUGOUT("  PAD_CONFIG_REG(26) AFTER  = 0x%08lX\n",
            (unsigned long)PAD_CONFIG_REG(26));
 
   /* Configure GPIO_25 (SCK) and GPIO_27 (MOSI) for output */
   /* Clear REN (Receiver Enable) to ensure output mode */
   PAD_CONFIG_REG(25) &= ~PADCONFIG_REN_BIT;
   PAD_CONFIG_REG(27) &= ~PADCONFIG_REN_BIT;
-  
+
   /* Enable receiver on GPIO_29 (BUSY) - input pin
    * Per Table 11.3, GPIO_26-29 have REN=1 at reset, but enable explicitly
    */
@@ -363,7 +387,7 @@ static void configure_gpio_pads(void) {
 
   DEBUGOUT("LR1121: PAD_CONFIG summary:\n");
   DEBUGOUT("  GPIO_25 (CLK)  = 0x%08lX\n", (unsigned long)PAD_CONFIG_REG(25));
-  DEBUGOUT("  GPIO_26 (MISO) = 0x%08lX (REN bit=%d)\n", 
+  DEBUGOUT("  GPIO_26 (MISO) = 0x%08lX (REN bit=%d)\n",
            (unsigned long)PAD_CONFIG_REG(26),
            (PAD_CONFIG_REG(26) & PADCONFIG_REN_BIT) ? 1 : 0);
   DEBUGOUT("  GPIO_27 (MOSI) = 0x%08lX\n", (unsigned long)PAD_CONFIG_REG(27));
@@ -377,32 +401,37 @@ static void configure_gpio_pads(void) {
    * Without these, the pins stay in Host Interface (SDIO) mode!
    */
   DEBUGOUT("LR1121: Configuring GPIO pads for Hardware GSPI...\n");
-  
+
   /* Enable EGPIO clocks */
   CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT;
   CLK_ENABLE_SET_REG3 = EGPIO_CLK_ENABLE_BIT;
-  for (volatile int i = 0; i < 1000; i++) { }
-  
+  for (volatile int i = 0; i < 1000; i++) {
+  }
+
   /* Take MCU control of GPIO_25-30 from NWP */
   MEM_GPIO_ACCESS_CTRL_SET = NWP_MCUHP_GPIO_CTRL2_BIT;
-  for (volatile int i = 0; i < 100; i++) { }
-  
-  /* CRITICAL: Enable GPIO mode for GPIO_26-30 
+  for (volatile int i = 0; i < 100; i++) {
+  }
+
+  /* CRITICAL: Enable GPIO mode for GPIO_26-30
    * At reset, bits 14-18 are 0 = Host Interface (SDIO) mode
    * Must set to 1 for GPIO/peripheral mode
    */
-  DEBUGOUT("  MCR_GENERIC_CTRL_1 BEFORE: 0x%08lX\n", (unsigned long)MCR_GENERIC_CTRL_1_REG);
+  DEBUGOUT("  MCR_GENERIC_CTRL_1 BEFORE: 0x%08lX\n",
+           (unsigned long)MCR_GENERIC_CTRL_1_REG);
   MCR_GENERIC_CTRL_1_REG |= HOST_PADS_GPIO_MODE_ALL;
-  for (volatile int i = 0; i < 100; i++) { }
-  DEBUGOUT("  MCR_GENERIC_CTRL_1 AFTER:  0x%08lX\n", (unsigned long)MCR_GENERIC_CTRL_1_REG);
-  
+  for (volatile int i = 0; i < 100; i++) {
+  }
+  DEBUGOUT("  MCR_GENERIC_CTRL_1 AFTER:  0x%08lX\n",
+           (unsigned long)MCR_GENERIC_CTRL_1_REG);
+
   /* Enable receiver on MISO (GPIO_26) - CRITICAL for reads! */
   PAD_CONFIG_REG(26) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
-  
+
   /* Enable receiver on BUSY (GPIO_29) */
   PAD_CONFIG_REG(29) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
-  
-  DEBUGOUT("  PAD_CONFIG_REG(26/MISO) = 0x%08lX (REN=%d)\n", 
+
+  DEBUGOUT("  PAD_CONFIG_REG(26/MISO) = 0x%08lX (REN=%d)\n",
            (unsigned long)PAD_CONFIG_REG(26),
            (PAD_CONFIG_REG(26) & PADCONFIG_REN_BIT) ? 1 : 0);
 #endif
@@ -442,9 +471,7 @@ static void delay_us(uint32_t us) {
  * Citation: siw917x-family-rm.pdf Rev 1.2, Table 11.4, p.292
  * GPIO_29 (BUSY) is bit 13 of PORT 1
  */
-static int read_busy_pin(void) {
-  return HP_GPIO_READ(LR1121_PIN_BUSY);
-}
+static int read_busy_pin(void) { return HP_GPIO_READ(LR1121_PIN_BUSY); }
 
 /**
  * @brief Assert CS (drive LOW) using direct PORT 1 register access
@@ -454,6 +481,9 @@ static int read_busy_pin(void) {
  * GPIO_28 (CS) is bit 12 of PORT 1
  */
 static void cs_assert(void) {
+  /* Pause hardware timer ISR to prevent SPI re-entrancy from hwTimer */
+  hw_timer_pause_isr();
+
   HP_GPIO_SET_LOW(LR1121_PIN_NSS);
   delay_us(1); /* NSS setup time */
 }
@@ -467,6 +497,9 @@ static void cs_deassert(void) {
   delay_us(1); /* NSS hold time */
   HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
   delay_us(1); /* Inter-transaction gap */
+
+  /* Resume hardware timer ISR now that SPI is fully complete */
+  hw_timer_resume_isr();
 }
 
 /**
@@ -555,12 +588,12 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
   return true;
 #else
   /* Hardware GSPI Transfer using SDK API functions
-   * 
+   *
    * This uses the SDK's sl_si91x_gspi_transfer_data() which should handle
    * the full-duplex SPI transfer properly. We manage CS manually.
    */
   sl_status_t status;
-  
+
   /* CRITICAL: DMA requires static buffers with proper alignment!
    * Stack buffers don't work with DMA because:
    * 1. DMA operates asynchronously after function returns
@@ -575,22 +608,25 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
   static volatile uint8_t __attribute__((aligned(4))) temp_rx[256];
 
   if (length > sizeof(temp_tx)) {
-    DEBUGOUT("LR1121: SPI transfer too long (%d > %d)\n", length, (int)sizeof(temp_tx));
+    DEBUGOUT("LR1121: SPI transfer too long (%d > %d)\n", length,
+             (int)sizeof(temp_tx));
     return false;
   }
 
   /* Clear RX buffer with marker pattern to detect if DMA updates it */
-  memset((void*)temp_rx, 0xAA, length);
+  memset((void *)temp_rx, 0xAA, length);
 
   /* Prepare TX buffer */
   if (tx_data != NULL) {
-    memcpy((void*)temp_tx, tx_data, length);
+    memcpy((void *)temp_tx, tx_data, length);
   } else {
-    memset((void*)temp_tx, 0x00, length);
+    memset((void *)temp_tx, 0x00, length);
   }
-  
-  /* Memory barrier to ensure CPU writes to TX buffer are complete before DMA starts
-   * __DSB() - Data Synchronization Barrier: ensures all memory accesses complete
+
+  /* Memory barrier to ensure CPU writes to TX buffer are complete before DMA
+   * starts
+   * __DSB() - Data Synchronization Barrier: ensures all memory accesses
+   * complete
    * __ISB() - Instruction Synchronization Barrier: flushes pipeline
    */
   __DSB();
@@ -602,20 +638,18 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
   /* Reset transfer complete flag */
   gspi_transfer_complete = false;
 
-  /* Use SDK transfer function for full-duplex SPI
-   * This should send temp_tx while receiving into temp_rx simultaneously
-   */
-  status = sl_si91x_gspi_transfer_data(gspi_handle, (uint8_t*)temp_tx, (uint8_t*)temp_rx, length);
-  
-  /* ALWAYS wait for transfer complete, regardless of status.
-   * The SDK may return various status codes, but we need to ensure
-   * the DMA has actually finished before reading the data.
-   */
+  /* Perform the DMA transfer */
+  status = sl_si91x_gspi_transfer_data(gspi_handle, (uint8_t *)temp_tx,
+                                       (uint8_t *)temp_rx, length);
+
   if (status != SL_STATUS_OK && status != SL_STATUS_EMPTY) {
-    DEBUGOUT("LR1121: SDK sl_si91x_gspi_transfer_data failed: 0x%04lX\n", (unsigned long)status);
+    DEBUGOUT("LR1121: SPI xfer fail: 0x%04lX\n", (unsigned long)status);
+    /* Clear stuck busy flag via ARM_SPI_ABORT_TRANSFER */
+    ARM_DRIVER_SPI *drv = (ARM_DRIVER_SPI *)gspi_handle;
+    drv->Control(ARM_SPI_ABORT_TRANSFER, 0);
     return false;
   }
-  
+
   /* Wait for transfer to complete (callback sets flag)
    * CRITICAL: Always wait, even if status is SL_STATUS_EMPTY
    */
@@ -623,21 +657,22 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
   while (!gspi_transfer_complete && timeout > 0) {
     timeout--;
   }
-  
+
   if (timeout == 0) {
-    DEBUGOUT("LR1121: SPI transfer timeout (status was 0x%04lX)\n", (unsigned long)status);
+    DEBUGOUT("LR1121: SPI transfer timeout (status was 0x%04lX)\n",
+             (unsigned long)status);
     return false;
   }
-  
+
   /* Memory barrier to ensure DMA writes are visible to CPU
    * This is critical for ARM Cortex-M4 with DMA
    */
   __DSB();
   __ISB();
-  
+
   /* Copy received data to output buffer if provided */
   if (rx_data != NULL) {
-    memcpy(rx_data, (void*)temp_rx, length);
+    memcpy(rx_data, (void *)temp_rx, length);
   }
 
   return true;
@@ -660,7 +695,7 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
  * @return true on success, false on error
  */
 static bool lr1121_send_command_internal(uint16_t opcode, const uint8_t *params,
-                                        uint16_t param_len) {
+                                         uint16_t param_len) {
   uint8_t tx_buf[16]; /* Command buffer: 2 bytes opcode + up to 14 params */
   uint8_t rx_buf[16]; /* Receive buffer (we ignore this for command phase) */
   uint16_t total_len = 2 + param_len;
@@ -678,12 +713,10 @@ static bool lr1121_send_command_internal(uint16_t opcode, const uint8_t *params,
     memcpy(&tx_buf[2], params, param_len);
   }
 
-  /* DEBUG: Show full command buffer before sending */
-  DEBUGOUT("[CMD] total_len=%u bytes: ", total_len);
-  for (uint16_t i = 0; i < total_len; i++) {
-    DEBUGOUT("%02X ", tx_buf[i]);
-  }
-  DEBUGOUT("\n");
+  /* NOTE: Debug hex dump removed - caused SPI failures by adding
+   * massive printf delays between every SPI command when hwTimer
+   * ISR was running (Gemini 3.1 debugging artifact).
+   */
 
   /* Assert CS, send command, deassert CS */
   cs_assert();
@@ -772,22 +805,23 @@ lr1121_status_t lr1121_init(void) {
    * GPIO_CONFIG_REG_x DIRECTION bit: 0 = Output, 1 = Input
    * GPIO_CONFIG_REG_x MODE bits[5:2]: 0 = GPIO mode (not peripheral)
    */
-  DEBUGOUT("LR1121: Initializing Soft SPI (Bit-Bang) with direct register access...\n");
+  DEBUGOUT("LR1121: Initializing Soft SPI (Bit-Bang) with direct register "
+           "access...\n");
 
   /* Set all pins to GPIO mode (MODE=0) by clearing bits 5:2 */
-  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK)  &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI) &= ~(0xF << 2);
-  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS)  &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_BUSY) &= ~(0xF << 2);
-  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_RST)  &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_RST) &= ~(0xF << 2);
 
   /* Configure outputs: SCK (25), MOSI (27), CS (28), RST (30) */
   HP_GPIO_SET_OUTPUT(LR1121_PIN_SCK);
   HP_GPIO_SET_OUTPUT(LR1121_PIN_MOSI);
   HP_GPIO_SET_OUTPUT(LR1121_PIN_NSS);
   HP_GPIO_SET_OUTPUT(LR1121_PIN_RST);
-  
+
   /* Configure inputs: MISO (26), BUSY (29) */
   HP_GPIO_SET_INPUT(LR1121_PIN_MISO);
   HP_GPIO_SET_INPUT(LR1121_PIN_BUSY);
@@ -795,8 +829,8 @@ lr1121_status_t lr1121_init(void) {
   /* Set Idle State (SPI Mode 0: SCK Low, MOSI Low, CS High, RST High) */
   HP_GPIO_SET_LOW(LR1121_PIN_SCK);
   HP_GPIO_SET_LOW(LR1121_PIN_MOSI);
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);  /* CS idle HIGH */
-  HP_GPIO_SET_HIGH(LR1121_PIN_RST);  /* RST idle HIGH (not in reset) */
+  HP_GPIO_SET_HIGH(LR1121_PIN_NSS); /* CS idle HIGH */
+  HP_GPIO_SET_HIGH(LR1121_PIN_RST); /* RST idle HIGH (not in reset) */
 #else
   /* Step 2: Configure BUSY pin (GPIO_29) as input */
   DEBUGOUT("LR1121: Configuring BUSY pin (GPIO-%d) as input\n",
@@ -817,11 +851,11 @@ lr1121_status_t lr1121_init(void) {
 #ifdef USE_SOFT_SPI
 
   DEBUGOUT("LR1121: GPIO_CONFIG_REG direction configured\n");
-  
+
   /* ========== GPIO DIAGNOSTIC TEST ========== */
   DEBUGOUT("\n=== GPIO Pin Diagnostic (WITH CLOCK ENABLE FIX) ===\n");
   DEBUGOUT("Direction: 0=output, 1=input\n");
-  
+
   /* Check direction configuration */
   uint32_t dir25 = EGPIO_GPIO_CONFIG_REG(25) & 1;
   uint32_t dir26 = EGPIO_GPIO_CONFIG_REG(26) & 1;
@@ -829,53 +863,72 @@ lr1121_status_t lr1121_init(void) {
   uint32_t dir28 = EGPIO_GPIO_CONFIG_REG(28) & 1;
   uint32_t dir29 = EGPIO_GPIO_CONFIG_REG(29) & 1;
   uint32_t dir30 = EGPIO_GPIO_CONFIG_REG(30) & 1;
-  
+
   DEBUGOUT("GPIO_CONFIG_REG direction check:\n");
-  DEBUGOUT("  GPIO_25 (SCK):  dir=%lu %s\n", (unsigned long)dir25, dir25==0 ? "OK" : "FAIL");
-  DEBUGOUT("  GPIO_26 (MISO): dir=%lu %s\n", (unsigned long)dir26, dir26==1 ? "OK" : "FAIL");
-  DEBUGOUT("  GPIO_27 (MOSI): dir=%lu %s\n", (unsigned long)dir27, dir27==0 ? "OK" : "FAIL");
-  DEBUGOUT("  GPIO_28 (CS):   dir=%lu %s\n", (unsigned long)dir28, dir28==0 ? "OK" : "FAIL");
-  DEBUGOUT("  GPIO_29 (BUSY): dir=%lu %s\n", (unsigned long)dir29, dir29==1 ? "OK" : "FAIL");
-  DEBUGOUT("  GPIO_30 (RST):  dir=%lu %s\n", (unsigned long)dir30, dir30==0 ? "OK" : "FAIL");
+  DEBUGOUT("  GPIO_25 (SCK):  dir=%lu %s\n", (unsigned long)dir25,
+           dir25 == 0 ? "OK" : "FAIL");
+  DEBUGOUT("  GPIO_26 (MISO): dir=%lu %s\n", (unsigned long)dir26,
+           dir26 == 1 ? "OK" : "FAIL");
+  DEBUGOUT("  GPIO_27 (MOSI): dir=%lu %s\n", (unsigned long)dir27,
+           dir27 == 0 ? "OK" : "FAIL");
+  DEBUGOUT("  GPIO_28 (CS):   dir=%lu %s\n", (unsigned long)dir28,
+           dir28 == 0 ? "OK" : "FAIL");
+  DEBUGOUT("  GPIO_29 (BUSY): dir=%lu %s\n", (unsigned long)dir29,
+           dir29 == 1 ? "OK" : "FAIL");
+  DEBUGOUT("  GPIO_30 (RST):  dir=%lu %s\n", (unsigned long)dir30,
+           dir30 == 0 ? "OK" : "FAIL");
 
   /* Test BIT_LOAD_REG reads (individual pin read - recommended) */
   DEBUGOUT("\nBIT_LOAD_REG reads (recommended for individual pins):\n");
-  DEBUGOUT("  BIT_LOAD_REG(26/MISO) = %lu\n", (unsigned long)(EGPIO_BIT_LOAD_REG(26) & 1));
-  DEBUGOUT("  BIT_LOAD_REG(29/BUSY) = %lu\n", (unsigned long)(EGPIO_BIT_LOAD_REG(29) & 1));
-  
+  DEBUGOUT("  BIT_LOAD_REG(26/MISO) = %lu\n",
+           (unsigned long)(EGPIO_BIT_LOAD_REG(26) & 1));
+  DEBUGOUT("  BIT_LOAD_REG(29/BUSY) = %lu\n",
+           (unsigned long)(EGPIO_BIT_LOAD_REG(29) & 1));
+
   /* Test PORT1_READ_REG (bulk read) */
   DEBUGOUT("\nPORT1_READ_REG = 0x%08lX\n", (unsigned long)EGPIO_PORT1_READ_REG);
-  DEBUGOUT("  bit9  (GPIO_25/SCK)  = %lu\n", (unsigned long)HP_GPIO_READ_PORT1(25));
-  DEBUGOUT("  bit10 (GPIO_26/MISO) = %lu\n", (unsigned long)HP_GPIO_READ_PORT1(26));
-  DEBUGOUT("  bit11 (GPIO_27/MOSI) = %lu\n", (unsigned long)HP_GPIO_READ_PORT1(27));
-  DEBUGOUT("  bit12 (GPIO_28/CS)   = %lu\n", (unsigned long)HP_GPIO_READ_PORT1(28));
-  DEBUGOUT("  bit13 (GPIO_29/BUSY) = %lu\n", (unsigned long)HP_GPIO_READ_PORT1(29));
-  DEBUGOUT("  bit14 (GPIO_30/RST)  = %lu\n", (unsigned long)HP_GPIO_READ_PORT1(30));
+  DEBUGOUT("  bit9  (GPIO_25/SCK)  = %lu\n",
+           (unsigned long)HP_GPIO_READ_PORT1(25));
+  DEBUGOUT("  bit10 (GPIO_26/MISO) = %lu\n",
+           (unsigned long)HP_GPIO_READ_PORT1(26));
+  DEBUGOUT("  bit11 (GPIO_27/MOSI) = %lu\n",
+           (unsigned long)HP_GPIO_READ_PORT1(27));
+  DEBUGOUT("  bit12 (GPIO_28/CS)   = %lu\n",
+           (unsigned long)HP_GPIO_READ_PORT1(28));
+  DEBUGOUT("  bit13 (GPIO_29/BUSY) = %lu\n",
+           (unsigned long)HP_GPIO_READ_PORT1(29));
+  DEBUGOUT("  bit14 (GPIO_30/RST)  = %lu\n",
+           (unsigned long)HP_GPIO_READ_PORT1(30));
 
   /* Test HP_GPIO_READ macro (using BIT_LOAD_REG) */
   DEBUGOUT("\nHP_GPIO_READ macro (uses BIT_LOAD_REG):\n");
-  DEBUGOUT("  HP_GPIO_READ(26/MISO) = %lu\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO));
-  DEBUGOUT("  HP_GPIO_READ(29/BUSY) = %lu\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY));
-  
+  DEBUGOUT("  HP_GPIO_READ(26/MISO) = %lu\n",
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO));
+  DEBUGOUT("  HP_GPIO_READ(29/BUSY) = %lu\n",
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY));
+
   /* Test: Read MISO 10 times in a row */
   DEBUGOUT("\nMISO 10-sample test: ");
   for (int i = 0; i < 10; i++) {
     DEBUGOUT("%lu", (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO));
-    for (volatile int d = 0; d < 1000; d++);
+    for (volatile int d = 0; d < 1000; d++)
+      ;
   }
   DEBUGOUT("\n");
-  
+
   /* Test: Toggle CLK and read MISO (should stay stable if no device) */
   DEBUGOUT("MISO while toggling CLK: ");
   for (int i = 0; i < 8; i++) {
     HP_GPIO_SET_HIGH(LR1121_PIN_SCK);
-    for (volatile int d = 0; d < 100; d++);
+    for (volatile int d = 0; d < 100; d++)
+      ;
     DEBUGOUT("%lu", (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO));
     HP_GPIO_SET_LOW(LR1121_PIN_SCK);
-    for (volatile int d = 0; d < 100; d++);
+    for (volatile int d = 0; d < 100; d++)
+      ;
   }
   DEBUGOUT("\n");
-  
+
   /* NOTE: Hardware verification test MOVED to lr1121_hw_verification_test()
    * The test should be run AFTER reset, not during init, because
    * the LR1121 won't respond correctly until it's been reset.
@@ -890,14 +943,14 @@ lr1121_status_t lr1121_init(void) {
 
   /* =========================================================================
    * SIMPLIFIED GSPI INIT - Matching working sl_si91x_gspi example
-   * 
+   *
    * The working example uses only these SDK calls:
    *   1. sl_si91x_gspi_init()
    *   2. sl_si91x_gspi_set_configuration()
    *   3. sl_si91x_gspi_register_event_callback()
    *
    * REMOVED (not in working example):
-   *   - sl_si91x_gspi_configure_clock() 
+   *   - sl_si91x_gspi_configure_clock()
    *   - sl_si91x_gspi_set_slave_number() during init (moved to before transfer)
    *   - sl_si91x_gspi_set_master_state()
    *   - configure_gspi_peripheral() direct register writes
@@ -923,14 +976,16 @@ lr1121_status_t lr1121_init(void) {
   DEBUGOUT("LR1121: GSPI init OK\n");
 
   /* Step 2: Configure GSPI parameters
-   * NOTE: swap_read = 1 matches Silicon Labs gspi_example.c (GSPI_SWAP_READ_DATA = 1)
+   * NOTE: swap_read = 1 matches Silicon Labs gspi_example.c
+   * (GSPI_SWAP_READ_DATA = 1)
    */
   sl_gspi_control_config_t gspi_config = {
       .bit_width = 8,
       .clock_mode = SL_GSPI_MODE_0,
       .slave_select_mode = SL_GSPI_MASTER_HW_OUTPUT,
-      .bitrate = 2000000,           /* 2 MHz - SLOW for debugging SPI issues */
-      .swap_read = 0,               /* FIXED: Disable read swap - was corrupting packet data */
+      .bitrate = 8000000, /* 8 MHz - Production speed */
+      .swap_read =
+          0, /* FIXED: Disable read swap - was corrupting packet data */
       .swap_write = 0,
   };
 
@@ -942,7 +997,8 @@ lr1121_status_t lr1121_init(void) {
   DEBUGOUT("LR1121: GSPI configured: 2 MHz (SLOW DEBUG), Mode 0, 8-bit\n");
 
   /* Step 3: Register callback */
-  status = sl_si91x_gspi_register_event_callback(gspi_handle, gspi_callback_event);
+  status =
+      sl_si91x_gspi_register_event_callback(gspi_handle, gspi_callback_event);
   if (status != SL_STATUS_OK && status != SL_STATUS_BUSY) {
     DEBUGOUT("LR1121: GSPI callback registration failed: 0x%04lX\n", status);
     return LR1121_ERROR_SPI_INIT;
@@ -1076,8 +1132,9 @@ lr1121_status_t lr1121_get_version(lr1121_version_t *version) {
   }
   DEBUGOUT(" OK\n");
 
-  /* Phase 2: Read response (6 bytes: stat1(dummy) + Status + HW + Type + Version[2])
-   * Citation: LR11xx protocol requires reading 1 extra dummy byte at start
+  /* Phase 2: Read response (6 bytes: stat1(dummy) + Status + HW + Type +
+   * Version[2]) Citation: LR11xx protocol requires reading 1 extra dummy byte
+   * at start
    */
   DEBUGOUT("Phase 2: Reading response (6 bytes: 1 dummy + 5 data)...\n");
   if (!lr1121_read_response_internal(response, sizeof(response))) {
@@ -1086,7 +1143,7 @@ lr1121_status_t lr1121_get_version(lr1121_version_t *version) {
   }
 
   /* Parse response according to Semtech LR11xx User Manual Section 2.3.1
-   * 
+   *
    * GetVersion (0x0101) Response Format:
    *   Byte 0: stat1 (status byte returned during read phase)
    *   Byte 1: HW version (0x22 = LR1121)
@@ -1097,17 +1154,17 @@ lr1121_status_t lr1121_get_version(lr1121_version_t *version) {
    *
    * Note: There is NO separate "stat2" - stat1 already contains the status!
    */
-  uint8_t stat1 = response[0];       /* Status byte (stat1) - check for errors */
-  uint8_t hw_version = response[1];  /* Hardware version (0x22 = LR1121) */
-  uint8_t fw_use = response[2];      /* Firmware use/type */
-  uint8_t fw_major = response[3];    /* Firmware major version */
-  uint8_t fw_minor = response[4];    /* Firmware minor version */
+  uint8_t stat1 = response[0];      /* Status byte (stat1) - check for errors */
+  uint8_t hw_version = response[1]; /* Hardware version (0x22 = LR1121) */
+  uint8_t fw_use = response[2];     /* Firmware use/type */
+  uint8_t fw_major = response[3];   /* Firmware major version */
+  uint8_t fw_minor = response[4];   /* Firmware minor version */
 
-  DEBUGOUT("\nResponse (raw): %02X %02X %02X %02X %02X %02X\n",
-           response[0], response[1], response[2], response[3], response[4], response[5]);
+  DEBUGOUT("\nResponse (raw): %02X %02X %02X %02X %02X %02X\n", response[0],
+           response[1], response[2], response[3], response[4], response[5]);
   DEBUGOUT("  stat1=0x%02X (status during read)\n", stat1);
-  DEBUGOUT("  HW=0x%02X   Use=0x%02X   FW=%d.%d\n", 
-           hw_version, fw_use, fw_major, fw_minor);
+  DEBUGOUT("  HW=0x%02X   Use=0x%02X   FW=%d.%d\n", hw_version, fw_use,
+           fw_major, fw_minor);
 
   /* Fill version structure */
   version->hardware = hw_version;
@@ -1143,9 +1200,9 @@ void lr1121_test_communication(void) {
    * - Reset pulse increased from 1ms to 100ms in lr1121_driver.h
    *************************************************************************/
   DEBUGOUT("\n--- FIX 1: Extended Hardware Reset ---\n");
-  DEBUGOUT("Reset pulse: %d ms (increased from 1ms for stuck recovery)\n", 
+  DEBUGOUT("Reset pulse: %d ms (increased from 1ms for stuck recovery)\n",
            LR1121_RESET_PULSE_MS);
-  
+
   status = lr1121_reset();
   if (status != LR1121_OK) {
     DEBUGOUT("FAILED: Reset error %d\n", status);
@@ -1222,7 +1279,7 @@ void lr1121_test_communication(void) {
     return;
   }
 
-  /* Print results 
+  /* Print results
    * Citation: LR1121 User Manual Section 2.3.1 "GetVersion"
    *   HW values: 0x01=LR1110, 0x02=LR1120, 0x22=LR1121
    *   Use values: 0x01=LR1121 transceiver, 0x03=Production firmware
@@ -1251,18 +1308,19 @@ void lr1121_test_communication(void) {
     DEBUGOUT(" (Unknown type)\n");
   }
 
-  DEBUGOUT("Firmware Version:     %d.%d (0x%04X)\n", 
-           (version.version >> 8) & 0xFF, 
-           version.version & 0xFF, 
+  DEBUGOUT("Firmware Version:     %d.%d (0x%04X)\n",
+           (version.version >> 8) & 0xFF, version.version & 0xFF,
            version.version);
 
   /* Success check based on correct hardware ID */
   if (version.hardware == 0x22) {
     DEBUGOUT("\n*** SUCCESS: LR1121 communication verified! ***\n");
   } else if (version.hardware == 0x01 || version.hardware == 0x02) {
-    DEBUGOUT("\nNOTE: Detected LR11%d0, not LR1121\n", version.hardware == 0x01 ? 1 : 2);
+    DEBUGOUT("\nNOTE: Detected LR11%d0, not LR1121\n",
+             version.hardware == 0x01 ? 1 : 2);
   } else {
-    DEBUGOUT("\nWARNING: Unexpected hardware version 0x%02X\n", version.hardware);
+    DEBUGOUT("\nWARNING: Unexpected hardware version 0x%02X\n",
+             version.hardware);
     DEBUGOUT("This may indicate SPI communication issues.\n");
   }
   DEBUGOUT("\n");
@@ -1298,7 +1356,7 @@ lr1121_status_t lr1121_set_tcxo_mode(void) {
    * power source."
    *
    * The Core1121-HF module has its 32MHz TCXO powered directly from the
-   * module's 3.3V supply rail, NOT from the LR1121's internal VTCXO 
+   * module's 3.3V supply rail, NOT from the LR1121's internal VTCXO
    * regulator pin. This means:
    *
    * 1. The TCXO is already running as soon as VDD is applied
@@ -1313,7 +1371,7 @@ lr1121_status_t lr1121_set_tcxo_mode(void) {
   DEBUGOUT("  NOT from LR1121's internal VTCXO regulator\n");
   DEBUGOUT("  SetTcxoMode is NOT needed - TCXO already running!\n");
   DEBUGOUT("  (Set LR1121_TCXO_EXTERNAL_POWER=0 to enable SetTcxoMode)\n");
-  
+
   return LR1121_OK;
 #else
   /***************************************************************************
@@ -1321,24 +1379,26 @@ lr1121_status_t lr1121_set_tcxo_mode(void) {
    *
    * Citation: LR1121 Datasheet Section 11.2.5 "SetTcxoMode"
    *
-   * For modules where TCXO is powered from LR1121's internal VTCXO 
+   * For modules where TCXO is powered from LR1121's internal VTCXO
    * regulator, this command must be sent to enable the regulator and
    * configure the voltage.
    ***************************************************************************/
   uint8_t params[4];
-  
-  /* Voltage trim to actual voltage mapping (LR1121 User Manual Section 6.3.2) */
-  static const char* voltage_names[] = {
-    "1.6V", "1.7V", "1.8V", "2.2V", "2.4V", "2.7V", "3.0V", "3.3V"
-  };
-  const char* voltage_str = (LR1121_TCXO_VOLTAGE_TRIM <= 7) ? 
-                            voltage_names[LR1121_TCXO_VOLTAGE_TRIM] : "INVALID";
-  
+
+  /* Voltage trim to actual voltage mapping (LR1121 User Manual Section 6.3.2)
+   */
+  static const char *voltage_names[] = {"1.6V", "1.7V", "1.8V", "2.2V",
+                                        "2.4V", "2.7V", "3.0V", "3.3V"};
+  const char *voltage_str = (LR1121_TCXO_VOLTAGE_TRIM <= 7)
+                                ? voltage_names[LR1121_TCXO_VOLTAGE_TRIM]
+                                : "INVALID";
+
   DEBUGOUT("\n=== Sending SetTcxoMode command ===\n");
   DEBUGOUT("Citation: LR1121 User Manual Section 6.3.2\n");
-  DEBUGOUT("  Voltage Trim: 0x%02X (%s)\n", LR1121_TCXO_VOLTAGE_TRIM, voltage_str);
+  DEBUGOUT("  Voltage Trim: 0x%02X (%s)\n", LR1121_TCXO_VOLTAGE_TRIM,
+           voltage_str);
   DEBUGOUT("  Delay: 0x%06X (~50ms startup)\n", LR1121_TCXO_DELAY);
-  
+
   /* Wait for BUSY LOW before sending command */
   DEBUGOUT("Waiting for BUSY LOW...");
   if (!lr1121_wait_busy()) {
@@ -1346,33 +1406,34 @@ lr1121_status_t lr1121_set_tcxo_mode(void) {
     return LR1121_ERROR_BUSY_TIMEOUT;
   }
   DEBUGOUT(" OK\n");
-  
+
   /* Build parameter buffer:
    * [0] = Voltage trim (1 byte)
    * [1-3] = Delay in 30.52µs steps (3 bytes, MSB first)
-   * 
+   *
    * Citation: LR1121 User Manual Section 6.3.2 "SetTcxoMode"
    * Total command: [Opcode 2 bytes][Voltage 1 byte][Delay 3 bytes] = 6 bytes
    */
-  uint32_t delay_value = LR1121_TCXO_DELAY;  /* Force evaluation */
+  uint32_t delay_value = LR1121_TCXO_DELAY; /* Force evaluation */
   params[0] = LR1121_TCXO_VOLTAGE_TRIM;
-  params[1] = (uint8_t)((delay_value >> 16) & 0xFF);  /* Delay MSB */
-  params[2] = (uint8_t)((delay_value >> 8) & 0xFF);   /* Delay middle */
-  params[3] = (uint8_t)(delay_value & 0xFF);          /* Delay LSB */
-  
+  params[1] = (uint8_t)((delay_value >> 16) & 0xFF); /* Delay MSB */
+  params[2] = (uint8_t)((delay_value >> 8) & 0xFF);  /* Delay middle */
+  params[3] = (uint8_t)(delay_value & 0xFF);         /* Delay LSB */
+
   /* DEBUG: Verify params array contents */
   DEBUGOUT("  params[0] (voltage) = 0x%02X\n", params[0]);
   DEBUGOUT("  params[1] (delay MSB) = 0x%02X\n", params[1]);
   DEBUGOUT("  params[2] (delay MID) = 0x%02X\n", params[2]);
   DEBUGOUT("  params[3] (delay LSB) = 0x%02X\n", params[3]);
-  
+
   /* Send SetTcxoMode command */
   DEBUGOUT("Sending opcode 0x%04X...\n", LR1121_CMD_SET_TCXO_MODE);
-  if (!lr1121_send_command_internal(LR1121_CMD_SET_TCXO_MODE, params, sizeof(params))) {
+  if (!lr1121_send_command_internal(LR1121_CMD_SET_TCXO_MODE, params,
+                                    sizeof(params))) {
     DEBUGOUT("FAILED: SetTcxoMode command send failed!\n");
     return LR1121_ERROR_SPI_INIT;
   }
-  
+
   /* Wait for command to complete (PLL to lock) */
   DEBUGOUT("Waiting for PLL lock (BUSY LOW)...");
   if (!lr1121_wait_busy()) {
@@ -1380,7 +1441,7 @@ lr1121_status_t lr1121_set_tcxo_mode(void) {
     return LR1121_ERROR_BUSY_TIMEOUT;
   }
   DEBUGOUT(" OK - TCXO configured, PLL locked\n");
-  
+
   return LR1121_OK;
 #endif
 }
@@ -1400,7 +1461,7 @@ void lr1121_hw_verification_test(void) {
 #ifdef USE_SOFT_SPI
   DEBUGOUT("\n=== POST-RESET HARDWARE VERIFICATION TEST ===\n");
   DEBUGOUT("This test runs AFTER reset to verify LR1121 response.\n\n");
-  
+
   /* Test BUSY pin - should be LOW after successful reset */
   DEBUGOUT("1. BUSY Pin Test (should be LOW after reset):\n");
   DEBUGOUT("   BUSY reads (10 samples, 100ms apart): ");
@@ -1408,7 +1469,8 @@ void lr1121_hw_verification_test(void) {
   for (int i = 0; i < 10; i++) {
     int busy_val = HP_GPIO_READ(LR1121_PIN_BUSY);
     DEBUGOUT("%d", busy_val);
-    if (busy_val) busy_high_count++;
+    if (busy_val)
+      busy_high_count++;
     delay_ms(100);
   }
   DEBUGOUT("\n");
@@ -1420,24 +1482,25 @@ void lr1121_hw_verification_test(void) {
   } else {
     DEBUGOUT("(MIXED - LR1121 may be processing)\n");
   }
-  
+
   /* Test MISO with CS asserted after reset */
   DEBUGOUT("\n2. MISO Test with CS Asserted:\n");
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS);  /* Assert CS */
+  HP_GPIO_SET_LOW(LR1121_PIN_NSS); /* Assert CS */
   delay_ms(1);
-  
+
   DEBUGOUT("   MISO reads with CS=LOW (10 samples, 50ms apart): ");
   int miso_high_count = 0;
   for (int i = 0; i < 10; i++) {
     int miso_val = HP_GPIO_READ(LR1121_PIN_MISO);
     DEBUGOUT("%d", miso_val);
-    if (miso_val) miso_high_count++;
+    if (miso_val)
+      miso_high_count++;
     delay_ms(50);
   }
   DEBUGOUT("\n");
-  
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);  /* Deassert CS */
-  
+
+  HP_GPIO_SET_HIGH(LR1121_PIN_NSS); /* Deassert CS */
+
   DEBUGOUT("   MISO HIGH count: %d/10 ", miso_high_count);
   if (miso_high_count > 0 && miso_high_count < 10) {
     DEBUGOUT("(LR1121 is responding - GOOD)\n");
@@ -1446,41 +1509,41 @@ void lr1121_hw_verification_test(void) {
   } else {
     DEBUGOUT("(All HIGH - MISO may have pull-up)\n");
   }
-  
+
   /* Quick SPI test - send GetStatus command and check for non-zero response */
   DEBUGOUT("\n3. Quick SPI Response Test:\n");
   DEBUGOUT("   Sending GetStatus (0x0100) and reading response...\n");
-  
+
   /* Wait for BUSY LOW */
   if (!lr1121_wait_busy()) {
     DEBUGOUT("   BUSY timeout - cannot test SPI\n");
     goto test_end;
   }
-  
+
   /* Send GetStatus command (0x0100) */
   uint8_t cmd[2] = {0x01, 0x00};
   uint8_t rx[2];
   HP_GPIO_SET_LOW(LR1121_PIN_NSS);
   spi_transfer(cmd, rx, 2);
   HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
-  
-  delay_ms(1);  /* Wait for processing */
-  
+
+  delay_ms(1); /* Wait for processing */
+
   /* Wait for BUSY LOW */
   if (!lr1121_wait_busy()) {
     DEBUGOUT("   BUSY timeout after command\n");
     goto test_end;
   }
-  
+
   /* Read response */
   uint8_t nop[3] = {0x00, 0x00, 0x00};
   uint8_t resp[3];
   HP_GPIO_SET_LOW(LR1121_PIN_NSS);
   spi_transfer(nop, resp, 3);
   HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
-  
+
   DEBUGOUT("   Response: %02X %02X %02X\n", resp[0], resp[1], resp[2]);
-  
+
   if (resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0x00) {
     DEBUGOUT("   Result: All zeros - LR1121 NOT RESPONDING\n");
     DEBUGOUT("   Check: Physical connections, power supply, module presence\n");
@@ -1507,43 +1570,45 @@ test_end:
 void lr1121_reinit_spi(void) {
   DEBUGOUT("\n=== Re-initializing GSPI peripheral ===\n");
   DEBUGOUT("Citation: siw917x-family-rm.pdf Section 20\n");
-  
+
   /* Reset both TX and RX FIFOs
    * Citation: siw917x-family-rm.pdf Section 20.5.6 GSPI_FIFO_THRLD
    */
   DEBUGOUT("Resetting GSPI FIFOs...\n");
   uint32_t fifo_thrld = GSPI_FIFO_THRLD_REG;
   GSPI_FIFO_THRLD_REG = fifo_thrld | (1UL << 9) | (1UL << 8);
-  for (volatile int i = 0; i < 1000; i++) { }
+  for (volatile int i = 0; i < 1000; i++) {
+  }
   GSPI_FIFO_THRLD_REG = fifo_thrld;
-  
+
   /* Clear any pending manual operations
    * Citation: siw917x-family-rm.pdf Section 20.5.3 GSPI_CONFIG1
    */
   DEBUGOUT("Clearing GSPI manual mode bits...\n");
-  GSPI_CONFIG1_REG &= ~((1UL << 1) | (1UL << 2));  /* Clear GSPI_MANUAL_WR/RD */
-  for (volatile int i = 0; i < 100; i++) { }
-  
+  GSPI_CONFIG1_REG &= ~((1UL << 1) | (1UL << 2)); /* Clear GSPI_MANUAL_WR/RD */
+  for (volatile int i = 0; i < 100; i++) {
+  }
+
   /* Wait for GSPI not busy */
   uint32_t timeout = 10000;
   while ((GSPI_STATUS_REG & GSPI_STATUS_BUSY) && timeout > 0) {
     timeout--;
   }
-  
+
   if (timeout == 0) {
     DEBUGOUT("WARNING: GSPI still busy after reset!\n");
   } else {
     DEBUGOUT("GSPI re-initialized successfully\n");
   }
-  
+
   /* Ensure proper idle state for Soft SPI */
 #ifdef USE_SOFT_SPI
   DEBUGOUT("Setting SPI idle state (Mode 0)...\n");
-  HP_GPIO_SET_LOW(LR1121_PIN_SCK);   /* SCK idle LOW for Mode 0 */
-  HP_GPIO_SET_LOW(LR1121_PIN_MOSI);  /* MOSI idle LOW */
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);  /* CS idle HIGH (deasserted) */
+  HP_GPIO_SET_LOW(LR1121_PIN_SCK);  /* SCK idle LOW for Mode 0 */
+  HP_GPIO_SET_LOW(LR1121_PIN_MOSI); /* MOSI idle LOW */
+  HP_GPIO_SET_HIGH(LR1121_PIN_NSS); /* CS idle HIGH (deasserted) */
 #endif
-  
+
   DEBUGOUT("GSPI ready for communication\n\n");
 }
 
@@ -1584,88 +1649,107 @@ void lr1121_gpio_toggle_test(uint32_t cycles) {
   DEBUGOUT("  GPIO_26 (MISO) = mikroBUS pin 5  (MISO)\n");
   DEBUGOUT("  GPIO_29 (BUSY) = mikroBUS pin 15 (INT)\n");
   DEBUGOUT("\n");
-  
+
   if (cycles == 0) {
     DEBUGOUT("Running in INFINITE loop - reset MCU to exit\n");
   } else {
     DEBUGOUT("Running %lu cycles per pin\n", (unsigned long)cycles);
   }
   DEBUGOUT("\n");
-  
+
   /* Ensure GPIO configuration is correct */
   DEBUGOUT("Configuring GPIO pins...\n");
-  
+
   /* Enable EGPIO clocks */
   CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT;
   CLK_ENABLE_SET_REG3 = EGPIO_CLK_ENABLE_BIT;
-  for (volatile int i = 0; i < 1000; i++) { }
-  
+  for (volatile int i = 0; i < 1000; i++) {
+  }
+
   /* Take MCU control of GPIO_25-30 */
   MEM_GPIO_ACCESS_CTRL_SET = NWP_MCUHP_GPIO_CTRL2_BIT;
-  for (volatile int i = 0; i < 100; i++) { }
-  
+  for (volatile int i = 0; i < 100; i++) {
+  }
+
   /* Set GPIO mode for all pins */
-  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK)  &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI) &= ~(0xF << 2);
-  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS)  &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_BUSY) &= ~(0xF << 2);
-  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_RST)  &= ~(0xF << 2);
-  
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_RST) &= ~(0xF << 2);
+
   /* Configure outputs */
   HP_GPIO_SET_OUTPUT(LR1121_PIN_SCK);
   HP_GPIO_SET_OUTPUT(LR1121_PIN_MOSI);
   HP_GPIO_SET_OUTPUT(LR1121_PIN_NSS);
   HP_GPIO_SET_OUTPUT(LR1121_PIN_RST);
-  
+
   /* Configure inputs */
   HP_GPIO_SET_INPUT(LR1121_PIN_MISO);
   HP_GPIO_SET_INPUT(LR1121_PIN_BUSY);
-  
+
   /* Enable receiver on input pins */
   PAD_CONFIG_REG(LR1121_PIN_MISO) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
   PAD_CONFIG_REG(LR1121_PIN_BUSY) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
-  
+
   DEBUGOUT("GPIO pins configured\n\n");
-  
+
   /* CRITICAL: Enable GPIO mode for GPIO_26-30 via HOST_PADS_GPIO_MODE
    * Citation: siw917x-family-rm.pdf Rev 1.2, Section 24.5.15, p.612
    * At reset, these bits are 0 (Host Interface / SDIO mode), NOT GPIO mode!
    */
   DEBUGOUT("Setting HOST_PADS_GPIO_MODE for GPIO_26-30...\n");
-  DEBUGOUT("  MCR_GENERIC_CTRL_1 BEFORE: 0x%08lX\n", (unsigned long)MCR_GENERIC_CTRL_1_REG);
+  DEBUGOUT("  MCR_GENERIC_CTRL_1 BEFORE: 0x%08lX\n",
+           (unsigned long)MCR_GENERIC_CTRL_1_REG);
   MCR_GENERIC_CTRL_1_REG |= HOST_PADS_GPIO_MODE_ALL;
-  for (volatile int i = 0; i < 100; i++) { }
-  DEBUGOUT("  MCR_GENERIC_CTRL_1 AFTER:  0x%08lX\n", (unsigned long)MCR_GENERIC_CTRL_1_REG);
+  for (volatile int i = 0; i < 100; i++) {
+  }
+  DEBUGOUT("  MCR_GENERIC_CTRL_1 AFTER:  0x%08lX\n",
+           (unsigned long)MCR_GENERIC_CTRL_1_REG);
   DEBUGOUT("  HOST_PADS_GPIO_MODE bits[18:14] = 0x%lX (should be 0x1F)\n",
            (unsigned long)((MCR_GENERIC_CTRL_1_REG >> 14) & 0x1F));
-  
+
   /* Set high drive strength for output pins (E = 3 = 12mA) */
   DEBUGOUT("\nSetting PAD_CONFIG drive strength (12mA) for outputs...\n");
-  PAD_CONFIG_REG(LR1121_PIN_SCK)  = (PAD_CONFIG_REG(LR1121_PIN_SCK)  & ~0x3) | 0x3;  /* 12mA */
-  PAD_CONFIG_REG(LR1121_PIN_MOSI) = (PAD_CONFIG_REG(LR1121_PIN_MOSI) & ~0x3) | 0x3;  /* 12mA */
-  PAD_CONFIG_REG(LR1121_PIN_NSS)  = (PAD_CONFIG_REG(LR1121_PIN_NSS)  & ~0x3) | 0x3;  /* 12mA */
-  PAD_CONFIG_REG(LR1121_PIN_RST)  = (PAD_CONFIG_REG(LR1121_PIN_RST)  & ~0x3) | 0x3;  /* 12mA */
-  
+  PAD_CONFIG_REG(LR1121_PIN_SCK) =
+      (PAD_CONFIG_REG(LR1121_PIN_SCK) & ~0x3) | 0x3; /* 12mA */
+  PAD_CONFIG_REG(LR1121_PIN_MOSI) =
+      (PAD_CONFIG_REG(LR1121_PIN_MOSI) & ~0x3) | 0x3; /* 12mA */
+  PAD_CONFIG_REG(LR1121_PIN_NSS) =
+      (PAD_CONFIG_REG(LR1121_PIN_NSS) & ~0x3) | 0x3; /* 12mA */
+  PAD_CONFIG_REG(LR1121_PIN_RST) =
+      (PAD_CONFIG_REG(LR1121_PIN_RST) & ~0x3) | 0x3; /* 12mA */
+
   /* Dump all GPIO configuration registers for debugging */
   DEBUGOUT("\n=== Complete GPIO Register Dump ===\n");
-  
+
   DEBUGOUT("Register base addresses (verify these are correct!):\n");
-  DEBUGOUT("  EGPIO_BASE           = 0x%08lX (expect 0x46130000)\n", (unsigned long)EGPIO_BASE);
-  DEBUGOUT("  EGPIO_PORT1_BASE     = 0x%08lX (expect 0x46131040)\n", (unsigned long)EGPIO_PORT1_BASE);
-  DEBUGOUT("  BIT_LOAD_REG(25) addr= 0x%08lX\n", (unsigned long)(EGPIO_BASE + 0x004 + (0x10 * 25)));
-  DEBUGOUT("  BIT_LOAD_REG(27) addr= 0x%08lX\n", (unsigned long)(EGPIO_BASE + 0x004 + (0x10 * 27)));
-  DEBUGOUT("  BIT_LOAD_REG(28) addr= 0x%08lX\n", (unsigned long)(EGPIO_BASE + 0x004 + (0x10 * 28)));
-  DEBUGOUT("  BIT_LOAD_REG(30) addr= 0x%08lX\n", (unsigned long)(EGPIO_BASE + 0x004 + (0x10 * 30)));
-  
+  DEBUGOUT("  EGPIO_BASE           = 0x%08lX (expect 0x46130000)\n",
+           (unsigned long)EGPIO_BASE);
+  DEBUGOUT("  EGPIO_PORT1_BASE     = 0x%08lX (expect 0x46131040)\n",
+           (unsigned long)EGPIO_PORT1_BASE);
+  DEBUGOUT("  BIT_LOAD_REG(25) addr= 0x%08lX\n",
+           (unsigned long)(EGPIO_BASE + 0x004 + (0x10 * 25)));
+  DEBUGOUT("  BIT_LOAD_REG(27) addr= 0x%08lX\n",
+           (unsigned long)(EGPIO_BASE + 0x004 + (0x10 * 27)));
+  DEBUGOUT("  BIT_LOAD_REG(28) addr= 0x%08lX\n",
+           (unsigned long)(EGPIO_BASE + 0x004 + (0x10 * 28)));
+  DEBUGOUT("  BIT_LOAD_REG(30) addr= 0x%08lX\n",
+           (unsigned long)(EGPIO_BASE + 0x004 + (0x10 * 30)));
+
   DEBUGOUT("\nClock registers:\n");
-  DEBUGOUT("  CLK_ENABLE_SET_REG2 = 0x%08lX (bit21 EGPIO_PCLK)\n", (unsigned long)CLK_ENABLE_SET_REG2);
-  DEBUGOUT("  CLK_ENABLE_SET_REG3 = 0x%08lX (bit16 EGPIO_CLK)\n", (unsigned long)CLK_ENABLE_SET_REG3);
+  DEBUGOUT("  CLK_ENABLE_SET_REG2 = 0x%08lX (bit21 EGPIO_PCLK)\n",
+           (unsigned long)CLK_ENABLE_SET_REG2);
+  DEBUGOUT("  CLK_ENABLE_SET_REG3 = 0x%08lX (bit16 EGPIO_CLK)\n",
+           (unsigned long)CLK_ENABLE_SET_REG3);
   DEBUGOUT("\nControl registers:\n");
-  DEBUGOUT("  MEM_GPIO_ACCESS_CTRL_SET = 0x%08lX (bit5 MCU ctrl)\n", (unsigned long)MEM_GPIO_ACCESS_CTRL_SET);
-  DEBUGOUT("  MCR_GENERIC_CTRL_1_REG   = 0x%08lX (bits14-18 GPIO mode)\n", (unsigned long)MCR_GENERIC_CTRL_1_REG);
+  DEBUGOUT("  MEM_GPIO_ACCESS_CTRL_SET = 0x%08lX (bit5 MCU ctrl)\n",
+           (unsigned long)MEM_GPIO_ACCESS_CTRL_SET);
+  DEBUGOUT("  MCR_GENERIC_CTRL_1_REG   = 0x%08lX (bits14-18 GPIO mode)\n",
+           (unsigned long)MCR_GENERIC_CTRL_1_REG);
   DEBUGOUT("\nGPIO_CONFIG_REG (DIRECTION bit0: 0=out, 1=in; MODE bits5:2):\n");
-  DEBUGOUT("  GPIO_25 (SCK):  0x%08lX (dir=%lu, mode=%lu)\n", 
+  DEBUGOUT("  GPIO_25 (SCK):  0x%08lX (dir=%lu, mode=%lu)\n",
            (unsigned long)EGPIO_GPIO_CONFIG_REG(25),
            (unsigned long)(EGPIO_GPIO_CONFIG_REG(25) & 1),
            (unsigned long)((EGPIO_GPIO_CONFIG_REG(25) >> 2) & 0xF));
@@ -1689,7 +1773,8 @@ void lr1121_gpio_toggle_test(uint32_t cycles) {
            (unsigned long)EGPIO_GPIO_CONFIG_REG(30),
            (unsigned long)(EGPIO_GPIO_CONFIG_REG(30) & 1),
            (unsigned long)((EGPIO_GPIO_CONFIG_REG(30) >> 2) & 0xF));
-  DEBUGOUT("\nPAD_CONFIG_REG (E bits1:0, POS bit2, SMT bit3, REN bit4, SR bit5, P bits7:6):\n");
+  DEBUGOUT("\nPAD_CONFIG_REG (E bits1:0, POS bit2, SMT bit3, REN bit4, SR "
+           "bit5, P bits7:6):\n");
   DEBUGOUT("  GPIO_25 (SCK):  0x%08lX (E=%lu, REN=%lu)\n",
            (unsigned long)PAD_CONFIG_REG(25),
            (unsigned long)(PAD_CONFIG_REG(25) & 0x3),
@@ -1715,85 +1800,93 @@ void lr1121_gpio_toggle_test(uint32_t cycles) {
            (unsigned long)(PAD_CONFIG_REG(30) & 0x3),
            (unsigned long)((PAD_CONFIG_REG(30) >> 4) & 1));
   DEBUGOUT("=== End Register Dump ===\n\n");
-  
+
   /* Start toggle test */
   uint32_t cycle_count = 0;
-  
+
   while (cycles == 0 || cycle_count < cycles) {
     cycle_count++;
-    
+
     DEBUGOUT("=== Cycle %lu ===\n", (unsigned long)cycle_count);
-    
+
     /* Read and display input pins */
     DEBUGOUT("INPUT pins: MISO(26)=%lu  BUSY(29)=%lu\n",
              (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO),
              (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY));
-    
+
     /* Test GPIO_25 (SCK) */
     DEBUGOUT("\nGPIO_25 (SCK) -> HIGH (expect ~3.3V on mikroBUS pin 4)\n");
     HP_GPIO_SET_HIGH(LR1121_PIN_SCK);
-    DEBUGOUT("  BIT_LOAD_REG(25) readback = %lu (expect 1)\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_SCK));
+    DEBUGOUT("  BIT_LOAD_REG(25) readback = %lu (expect 1)\n",
+             (unsigned long)HP_GPIO_READ(LR1121_PIN_SCK));
     delay_ms(500);
-    
+
     DEBUGOUT("GPIO_25 (SCK) -> LOW (expect ~0V on mikroBUS pin 4)\n");
     HP_GPIO_SET_LOW(LR1121_PIN_SCK);
-    DEBUGOUT("  BIT_LOAD_REG(25) readback = %lu (expect 0)\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_SCK));
+    DEBUGOUT("  BIT_LOAD_REG(25) readback = %lu (expect 0)\n",
+             (unsigned long)HP_GPIO_READ(LR1121_PIN_SCK));
     delay_ms(500);
-    
+
     /* Test GPIO_27 (MOSI) */
     DEBUGOUT("\nGPIO_27 (MOSI) -> HIGH (expect ~3.3V on mikroBUS pin 6)\n");
     HP_GPIO_SET_HIGH(LR1121_PIN_MOSI);
-    DEBUGOUT("  BIT_LOAD_REG(27) readback = %lu (expect 1)\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_MOSI));
+    DEBUGOUT("  BIT_LOAD_REG(27) readback = %lu (expect 1)\n",
+             (unsigned long)HP_GPIO_READ(LR1121_PIN_MOSI));
     delay_ms(500);
-    
+
     DEBUGOUT("GPIO_27 (MOSI) -> LOW (expect ~0V on mikroBUS pin 6)\n");
     HP_GPIO_SET_LOW(LR1121_PIN_MOSI);
-    DEBUGOUT("  BIT_LOAD_REG(27) readback = %lu (expect 0)\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_MOSI));
+    DEBUGOUT("  BIT_LOAD_REG(27) readback = %lu (expect 0)\n",
+             (unsigned long)HP_GPIO_READ(LR1121_PIN_MOSI));
     delay_ms(500);
-    
+
     /* Test GPIO_28 (CS) */
     DEBUGOUT("\nGPIO_28 (CS) -> HIGH (expect ~3.3V on mikroBUS pin 3)\n");
     HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
-    DEBUGOUT("  BIT_LOAD_REG(28) readback = %lu (expect 1)\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS));
+    DEBUGOUT("  BIT_LOAD_REG(28) readback = %lu (expect 1)\n",
+             (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS));
     delay_ms(500);
-    
+
     DEBUGOUT("GPIO_28 (CS) -> LOW (expect ~0V on mikroBUS pin 3)\n");
     HP_GPIO_SET_LOW(LR1121_PIN_NSS);
-    DEBUGOUT("  BIT_LOAD_REG(28) readback = %lu (expect 0)\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS));
+    DEBUGOUT("  BIT_LOAD_REG(28) readback = %lu (expect 0)\n",
+             (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS));
     delay_ms(500);
-    
+
     /* Test GPIO_30 (RST) */
     DEBUGOUT("\nGPIO_30 (RST) -> HIGH (expect ~3.3V on mikroBUS pin 16)\n");
     HP_GPIO_SET_HIGH(LR1121_PIN_RST);
-    DEBUGOUT("  BIT_LOAD_REG(30) readback = %lu (expect 1)\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_RST));
+    DEBUGOUT("  BIT_LOAD_REG(30) readback = %lu (expect 1)\n",
+             (unsigned long)HP_GPIO_READ(LR1121_PIN_RST));
     delay_ms(500);
-    
+
     DEBUGOUT("GPIO_30 (RST) -> LOW (expect ~0V on mikroBUS pin 16)\n");
     HP_GPIO_SET_LOW(LR1121_PIN_RST);
-    DEBUGOUT("  BIT_LOAD_REG(30) readback = %lu (expect 0)\n", (unsigned long)HP_GPIO_READ(LR1121_PIN_RST));
+    DEBUGOUT("  BIT_LOAD_REG(30) readback = %lu (expect 0)\n",
+             (unsigned long)HP_GPIO_READ(LR1121_PIN_RST));
     delay_ms(500);
-    
+
     /* Re-read input pins */
     DEBUGOUT("\nINPUT pins after toggle: MISO(26)=%lu  BUSY(29)=%lu\n",
              (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO),
              (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY));
-    
+
     DEBUGOUT("\n--- End Cycle %lu ---\n\n", (unsigned long)cycle_count);
-    
+
     /* Small delay between cycles */
     delay_ms(1000);
   }
-  
+
   /* Restore idle state */
   DEBUGOUT("Test complete. Restoring idle state...\n");
   HP_GPIO_SET_LOW(LR1121_PIN_SCK);
   HP_GPIO_SET_LOW(LR1121_PIN_MOSI);
   HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
   HP_GPIO_SET_HIGH(LR1121_PIN_RST);
-  
+
   DEBUGOUT("Idle state: SCK=LOW, MOSI=LOW, CS=HIGH, RST=HIGH\n");
   DEBUGOUT("\n=== GPIO Toggle Test Complete ===\n\n");
-  
+
 #else
   DEBUGOUT("GPIO Toggle Test requires USE_SOFT_SPI to be defined\n");
   (void)cycles;
@@ -1808,8 +1901,9 @@ void lr1121_gpio_toggle_test(uint32_t cycles) {
  * @brief Wait for BUSY pin to go LOW with configurable timeout
  */
 bool lr1121_wait_busy_timeout(uint32_t timeout_ms) {
-  uint32_t timeout_count = timeout_ms * 10; /* 10 iterations per ms approximately */
-  
+  uint32_t timeout_count =
+      timeout_ms * 10; /* 10 iterations per ms approximately */
+
   while (timeout_count > 0) {
     if (read_busy_pin() == 0) {
       return true;
@@ -1817,7 +1911,7 @@ bool lr1121_wait_busy_timeout(uint32_t timeout_ms) {
     delay_us(100);
     timeout_count--;
   }
-  
+
   return false;
 }
 
@@ -1825,7 +1919,8 @@ bool lr1121_wait_busy_timeout(uint32_t timeout_ms) {
  * @brief Wrapper to make lr1121_send_command public
  * Note: The static version is used internally, this wraps it for external use
  */
-bool lr1121_send_command_pub(uint16_t opcode, const uint8_t *params, uint16_t param_len) {
+bool lr1121_send_command_pub(uint16_t opcode, const uint8_t *params,
+                             uint16_t param_len) {
   uint8_t tx_buf[258]; /* Max opcode (2) + params (256) */
   uint8_t rx_buf[258];
   uint16_t total_len = 2 + param_len;
@@ -1849,7 +1944,8 @@ bool lr1121_send_command_pub(uint16_t opcode, const uint8_t *params, uint16_t pa
 }
 
 /* Alias for external linkage */
-bool lr1121_send_command(uint16_t opcode, const uint8_t *params, uint16_t param_len) {
+bool lr1121_send_command(uint16_t opcode, const uint8_t *params,
+                         uint16_t param_len) {
   return lr1121_send_command_pub(opcode, params, param_len);
 }
 
@@ -1864,30 +1960,29 @@ bool lr1121_read_response(uint8_t *response, uint16_t response_len) {
   }
 
   memset(tx_buf, 0x00, response_len);
-  memset(response, 0xBB, response_len);  /* Pre-fill to detect if SPI writes anything */
+  memset(response, 0xBB,
+         response_len); /* Pre-fill to detect if SPI writes anything */
 
   cs_assert();
   bool result = spi_transfer(tx_buf, response, response_len);
   cs_deassert();
-  
-  /* DEBUG: Show raw SPI read result */
-  DEBUGOUT("[SPI_RD] len=%d:", response_len);
-  for (int i = 0; i < (response_len > 20 ? 20 : response_len); i++) {
-    DEBUGOUT(" %02X", response[i]);
-  }
-  DEBUGOUT("\n");
+
+  /* NOTE: Debug hex dump removed - caused SPI failures by adding
+   * massive printf delays when hwTimer ISR was running
+   * (Gemini 3.1 debugging artifact).
+   */
 
   return result;
 }
 
 /**
  * @brief Get LR1121 status bytes
- * 
+ *
  * Citation: LR1121 User Manual Section 2.1 (GetStatus)
  * GetStatus returns status in the response bytes during command phase.
  */
 bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status) {
-  uint8_t tx_buf[4] = {0x01, 0x00, 0x00, 0x00};  /* GetStatus opcode + 2 NOP */
+  uint8_t tx_buf[4] = {0x01, 0x00, 0x00, 0x00}; /* GetStatus opcode + 2 NOP */
   uint8_t rx_buf[4];
 
   if (!lr1121_wait_busy_timeout(100)) {
@@ -1900,48 +1995,48 @@ bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status) {
 
   if (result) {
     /* Response format: [dummy][stat1][stat2][irq] */
-    if (stat1) *stat1 = rx_buf[1];
-    if (stat2) *stat2 = rx_buf[2];
-    if (irq_status) *irq_status = rx_buf[3];
+    if (stat1)
+      *stat1 = rx_buf[1];
+    if (stat2)
+      *stat2 = rx_buf[2];
+    if (irq_status)
+      *irq_status = rx_buf[3];
   }
 
   return result;
 }
 
-/* Note: lr1121_wait_busy(void) is defined earlier in this file for internal use.
- * Use lr1121_wait_busy_timeout() for external calls that need configurable timeout. */
+/* Note: lr1121_wait_busy(void) is defined earlier in this file for internal
+ * use. Use lr1121_wait_busy_timeout() for external calls that need configurable
+ * timeout. */
 
 /*******************************************************************************
  * Public Raw SPI Functions for Single-Phase Commands
- * 
+ *
  * These wrapper functions expose the internal static SPI functions for
  * commands like GetTemperature (0x011A) and GetRandomNumber (0x0120) that
  * require single-phase SPI transactions where the response is returned
  * DURING the command transaction, not in a separate Phase 2 NOP read.
- * 
+ *
  * Citation: LR1121 User Manual - Instant commands return data during the
  * command phase itself (opcode + NOPs in a single CS assertion).
  ******************************************************************************/
 
 /**
  * @brief Public wrapper: Assert CS (drive LOW) for SPI transaction
- * 
+ *
  * Citation: LR1121 Datasheet Section 3 "SPI Interface"
  * NSS must be driven LOW to select the LR1121 for SPI communication.
  */
-void lr1121_cs_assert(void) {
-  cs_assert();
-}
+void lr1121_cs_assert(void) { cs_assert(); }
 
 /**
  * @brief Public wrapper: Deassert CS (drive HIGH) after SPI transaction
- * 
+ *
  * Citation: LR1121 Datasheet Section 3 "SPI Interface"
  * NSS rising edge triggers command processing in the LR1121.
  */
-void lr1121_cs_deassert(void) {
-  cs_deassert();
-}
+void lr1121_cs_deassert(void) { cs_deassert(); }
 
 /**
  * @brief Public wrapper: Raw SPI transfer (full-duplex)
@@ -1958,58 +2053,60 @@ void lr1121_cs_deassert(void) {
  * @param length Number of bytes to transfer
  * @return true on success, false on error
  */
-bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data, uint16_t length) {
+bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
+                         uint16_t length) {
   return spi_transfer(tx_data, rx_data, length);
 }
 
 /*******************************************************************************
  * FIRMWARE UPDATE SUPPORT
- * 
+ *
  * Citation: ExpressLRS LR1121.cpp - Firmware update implementation
  ******************************************************************************/
 
 /* Additional bootloader opcodes needed for firmware update */
-#define LR11XX_SYSTEM_REBOOT_OC           0x0118  /* Reboot command */
+#define LR11XX_SYSTEM_REBOOT_OC 0x0118 /* Reboot command */
 
 /* Firmware update state structure */
 typedef struct {
-  uint32_t expected_size;    /**< Expected firmware size from X-FileSize header */
-  uint32_t total_size;       /**< Total bytes written to flash */
-  uint32_t left_over;        /**< Bytes remaining in buffer (< 256) */
-  uint8_t buffer[256];       /**< Write buffer (256 bytes per flash write) */
-  bool in_progress;          /**< Update is in progress */
+  uint32_t expected_size; /**< Expected firmware size from X-FileSize header */
+  uint32_t total_size;    /**< Total bytes written to flash */
+  uint32_t left_over;     /**< Bytes remaining in buffer (< 256) */
+  uint8_t buffer[256];    /**< Write buffer (256 bytes per flash write) */
+  bool in_progress;       /**< Update is in progress */
 } lr1121_update_state_t;
 
 /* Static update state (single update at a time) */
-static lr1121_update_state_t lr1121_update_state = { 0 };
+static lr1121_update_state_t lr1121_update_state = {0};
 
 /**
  * @brief Write buffered data to LR1121 flash (internal helper)
  */
 static bool lr1121_write_flash_chunk(const uint8_t *data, uint32_t data_size) {
-  uint8_t packet[262];  /* 2B opcode + 4B address + 256B data */
+  uint8_t packet[262]; /* 2B opcode + 4B address + 256B data */
   uint32_t write_size;
   uint32_t flash_address = lr1121_update_state.total_size;
 
   /* Build command header */
   packet[0] = (uint8_t)(LR1121_OPCODE_BL_WRITE_FLASH >> 8);   /* 0x80 */
   packet[1] = (uint8_t)(LR1121_OPCODE_BL_WRITE_FLASH & 0xFF); /* 0x03 */
-  packet[2] = (uint8_t)(flash_address >> 24);  /* Address MSB */
+  packet[2] = (uint8_t)(flash_address >> 24);                 /* Address MSB */
   packet[3] = (uint8_t)(flash_address >> 16);
   packet[4] = (uint8_t)(flash_address >> 8);
-  packet[5] = (uint8_t)(flash_address);        /* Address LSB */
+  packet[5] = (uint8_t)(flash_address); /* Address LSB */
 
   /* Calculate write size */
   write_size = lr1121_update_state.left_over;
   if (data != NULL) {
-    memcpy(lr1121_update_state.buffer + lr1121_update_state.left_over, data, data_size);
+    memcpy(lr1121_update_state.buffer + lr1121_update_state.left_over, data,
+           data_size);
     write_size += data_size;
   }
 
   /* Copy buffer to packet */
   memcpy(&packet[6], lr1121_update_state.buffer, write_size);
 
-  DEBUGOUT("LR1121 OTA: Write 0x%08lX (%lu bytes)\n", 
+  DEBUGOUT("LR1121 OTA: Write 0x%08lX (%lu bytes)\n",
            (unsigned long)flash_address, (unsigned long)write_size);
 
   /* Wait for BUSY LOW before sending */
@@ -2044,8 +2141,9 @@ static bool lr1121_write_flash_chunk(const uint8_t *data, uint32_t data_size) {
 /**
  * @brief Get LR1121 firmware version using specified command opcode
  */
-bool lr1121_get_firmware_version(lr1121_firmware_version_t *version, uint16_t opcode) {
-  uint8_t response[5];  /* stat1 + HW + Type + VerMSB + VerLSB */
+bool lr1121_get_firmware_version(lr1121_firmware_version_t *version,
+                                 uint16_t opcode) {
+  uint8_t response[5]; /* stat1 + HW + Type + VerMSB + VerLSB */
 
   if (version == NULL) {
     return false;
@@ -2092,7 +2190,8 @@ int lr1121_begin_update(uint32_t expected_size) {
   uint8_t mode;
 
   DEBUGOUT("\n=== LR1121 OTA: Beginning firmware update ===\n");
-  DEBUGOUT("LR1121 OTA: Expected size: %lu bytes\n", (unsigned long)expected_size);
+  DEBUGOUT("LR1121 OTA: Expected size: %lu bytes\n",
+           (unsigned long)expected_size);
 
   /* Initialize update state */
   memset(&lr1121_update_state, 0, sizeof(lr1121_update_state));
@@ -2101,7 +2200,7 @@ int lr1121_begin_update(uint32_t expected_size) {
 
   /* Step 1: Reboot LR1121 to bootloader mode */
   DEBUGOUT("LR1121 OTA: Rebooting to bootloader mode...\n");
-  mode = 3;  /* Bootloader mode */
+  mode = 3; /* Bootloader mode */
   if (!lr1121_send_command(LR11XX_SYSTEM_REBOOT_OC, &mode, 1)) {
     DEBUGOUT("LR1121 OTA: Failed to send reboot command\n");
     lr1121_update_state.in_progress = false;
@@ -2124,7 +2223,8 @@ int lr1121_begin_update(uint32_t expected_size) {
   }
 
   if (version.type != 0xDF) {
-    DEBUGOUT("LR1121 OTA: Not in bootloader! type=0x%02X (expected 0xDF)\n", version.type);
+    DEBUGOUT("LR1121 OTA: Not in bootloader! type=0x%02X (expected 0xDF)\n",
+             version.type);
     lr1121_update_state.in_progress = false;
     return -1;
   }
@@ -2132,12 +2232,12 @@ int lr1121_begin_update(uint32_t expected_size) {
 
   /* Step 3: Erase flash */
   DEBUGOUT("LR1121 OTA: Erasing flash (this takes ~3 seconds)...\n");
-  
-  uint8_t erase_tx[2] = {0x80, 0x01};  /* BL_ERASE_FLASH_OC */
+
+  uint8_t erase_tx[2] = {0x80, 0x01}; /* BL_ERASE_FLASH_OC */
   cs_assert();
   bool result = spi_transfer(erase_tx, NULL, 2);
   cs_deassert();
-  
+
   if (!result) {
     DEBUGOUT("LR1121 OTA: Failed to send erase command\n");
     lr1121_update_state.in_progress = false;
@@ -2149,7 +2249,8 @@ int lr1121_begin_update(uint32_t expected_size) {
   while (elapsed_ms < 10000) {
     int busy = read_busy_pin();
     if (busy == 0) {
-      DEBUGOUT("LR1121 OTA: Erase complete after %lu ms\n", (unsigned long)elapsed_ms);
+      DEBUGOUT("LR1121 OTA: Erase complete after %lu ms\n",
+               (unsigned long)elapsed_ms);
       break;
     }
     delay_ms(100);
@@ -2184,20 +2285,21 @@ int lr1121_write_update_bytes(const uint8_t *data, uint32_t size) {
     if (chunk_size > size) {
       chunk_size = size;
     }
-    
+
     if (!lr1121_write_flash_chunk(data, chunk_size)) {
       DEBUGOUT("LR1121 OTA: Flash write failed!\n");
       lr1121_update_state.in_progress = false;
       return -1;
     }
-    
+
     size -= chunk_size;
     data += chunk_size;
   }
 
   /* Store remaining data in buffer */
   if (size > 0) {
-    memcpy(lr1121_update_state.buffer + lr1121_update_state.left_over, data, size);
+    memcpy(lr1121_update_state.buffer + lr1121_update_state.left_over, data,
+           size);
     lr1121_update_state.left_over += size;
   }
 
@@ -2220,7 +2322,7 @@ int lr1121_end_update(void) {
 
   /* Step 1: Flush remaining buffered data */
   if (lr1121_update_state.left_over > 0) {
-    DEBUGOUT("LR1121 OTA: Flushing %lu remaining bytes\n", 
+    DEBUGOUT("LR1121 OTA: Flushing %lu remaining bytes\n",
              (unsigned long)lr1121_update_state.left_over);
     if (!lr1121_write_flash_chunk(NULL, 0)) {
       DEBUGOUT("LR1121 OTA: Final flush failed!\n");
@@ -2276,13 +2378,17 @@ int lr1121_end_update(void) {
 }
 
 /*******************************************************************************
- * DIO1 INTERRUPT SUPPORT using HP GPIO Pin Interrupt
- * 
- * DIO1 is connected to GPIO_6 (HP domain) for reliable interrupt handling.
- * Uses standard HP GPIO pin interrupt - simpler and more reliable than UULP.
- * 
- * HARDWARE WIRING: Connect LR1121 DIO1 to GPIO_6 on the SiW917.
- * 
+ * LR1121 DIO9 INTERRUPT SUPPORT using HP GPIO Pin Interrupt
+ *
+ * CRITICAL: LR1121 uses DIO9 for interrupts, NOT DIO1!
+ *   - LR1121 DIO1 is hardwired internally to SPI NSS (chip select)
+ *   - LR1121 DIO9 is the "generic IRQ line" for TX/RX done interrupts
+ *
+ * The code uses "DIO1" variable naming for ELRS legacy compatibility,
+ * but the PHYSICAL wire must connect LR1121 DIO9 to SiW917 GPIO_46.
+ *
+ * HARDWARE WIRING: Connect LR1121 DIO9 to GPIO_46 on the SiW917.
+ *
  * HP GPIO Pin Interrupts:
  *   - 8 independent pin interrupt channels (0-7)
  *   - Each channel can be assigned to any HP GPIO pin
@@ -2290,178 +2396,215 @@ int lr1121_end_update(void) {
  *   - IRQ52 (EGPIO_PIN_0_IRQn) through IRQ59 (EGPIO_PIN_7_IRQn)
  ******************************************************************************/
 
-/* DIO1 pin configuration - GPIO_46 (HP domain, available on breakout pad)
- * 
+/* DIO9 pin configuration - GPIO_46 (HP domain, available on breakout pad)
+ * NOTE: Variable named "DIO1" for ELRS compatibility, but this is LR1121 DIO9!
+ *
  * HP GPIO Port mapping:
  *   SL_GPIO_PORT_A = GPIO 0-15
  *   SL_GPIO_PORT_B = GPIO 16-31
  *   SL_GPIO_PORT_C = GPIO 32-47
  *   SL_GPIO_PORT_D = GPIO 48-63
- * 
+ *
  * GPIO_46 is on Port C (32-47), pin number within port = 46-32 = 14
  */
-#define DIO1_HP_GPIO        46
-#define DIO1_HP_PORT        SL_GPIO_PORT_C   /* Port C for GPIO 32-47 */
-#define DIO1_HP_PIN         (DIO1_HP_GPIO - 32)  /* Pin 14 within Port C */
-#define DIO1_INT_CHANNEL    0       /* Use pin interrupt channel 0 */
-
+#define DIO1_HP_GPIO 46             /* SiW917 GPIO connected to LR1121 DIO9 */
+#define DIO1_HP_PORT SL_GPIO_PORT_C /* Port C for GPIO 32-47 */
+#define DIO1_HP_PIN (DIO1_HP_GPIO - 32) /* Pin 14 within Port C */
+#define DIO1_INT_CHANNEL                                                       \
+  2 /* Try channel 2 in case 0 conflicts with GSPI DMA                         \
+     */
 /* Static pin config - needed for SDK calls */
 static sl_si91x_gpio_pin_config_t dio1_pin_config;
 
 /* Static callback storage */
 static lr1121_dio1_callback_t dio1_callback = NULL;
 static bool dio1_initialized = false;
-static volatile bool dio1_callback_enabled = false;  /* Don't call callback until system ready */
-static volatile uint32_t dio1_isr_count = 0;  /* Debug: count ISR entries */
+static volatile bool dio1_callback_enabled =
+    false; /* Don't call callback until system ready */
+static volatile uint32_t dio1_isr_count = 0; /* Debug: count ISR entries */
 
 /* Forward declaration of SDK callback */
 static void dio1_gpio_interrupt_callback(uint32_t pin_intr);
 
 /**
  * @brief Initialize DIO1 interrupt support using HP GPIO pin interrupt
- * 
+ *
  * Uses GPIO_46 with HP GPIO pin interrupt channel 0.
- * Pure SDK implementation - no direct register access.
+ *
+ * CRITICAL: Must configure:
+ *   1. EGPIO clocks enabled
+ *   2. PAD_CONFIG for receiver enable (REN) and schmitt trigger (SMT)
+ *   3. GPIO_CONFIG_REG for direction (input) and mode (GPIO)
+ *   4. Pin interrupt configuration
  */
-lr1121_status_t lr1121_dio1_init(void)
-{
+lr1121_status_t lr1121_dio1_init(void) {
   sl_status_t status;
-  
-  DEBUGOUT("LR1121: Initializing DIO1 interrupt on GPIO_%d (HP domain, SDK)...\n", DIO1_HP_GPIO);
-  
-  /* Step 1: Initialize GPIO driver */
+
+  DEBUGOUT("LR1121: Initializing DIO1 interrupt on GPIO_%d (HP domain)...\n",
+           DIO1_HP_GPIO);
+
+  /* Step 1: Ensure EGPIO clocks are enabled
+   * Citation: siw917x-family-rm.pdf Section 11.6.1
+   * These may already be enabled by lr1121_init(), but ensure they are.
+   */
+  CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT; /* Enable EGPIO APB clock */
+  CLK_ENABLE_SET_REG3 =
+      EGPIO_CLK_ENABLE_BIT; /* Enable EGPIO controller clock */
+  DEBUGOUT("  EGPIO clocks enabled\n");
+
+  /* Step 2: Initialize GPIO driver (for interrupt support & clocks) */
   status = sl_gpio_driver_init();
   if (status != SL_STATUS_OK && status != SL_STATUS_ALREADY_INITIALIZED) {
     DEBUGOUT("  sl_gpio_driver_init failed: 0x%04lX\n", (unsigned long)status);
     return LR1121_ERROR_GPIO_INIT;
   }
   DEBUGOUT("  GPIO driver initialized\n");
-  
-  /* Step 2: Configure GPIO_46 as input using SDK */
+
+  /* Step 3: Configure SDK pin structure */
   dio1_pin_config.port_pin.port = DIO1_HP_PORT;
   dio1_pin_config.port_pin.pin = DIO1_HP_PIN;
   dio1_pin_config.direction = GPIO_INPUT;
-  
+
+  /* Step 4: Configure pin using SiWx917 Unified API */
   status = sl_gpio_set_configuration(dio1_pin_config);
   if (status != SL_STATUS_OK) {
-    DEBUGOUT("  sl_gpio_set_configuration failed: 0x%04lX\n", (unsigned long)status);
+    DEBUGOUT("  sl_gpio_set_configuration failed: 0x%04lX\n",
+             (unsigned long)status);
     return LR1121_ERROR_GPIO_INIT;
   }
-  DEBUGOUT("  GPIO_%d configured as input (Port %d, Pin %d)\n", 
-           DIO1_HP_GPIO, DIO1_HP_PORT, DIO1_HP_PIN);
-  
-  /* Step 3: Set pin direction explicitly using SDK */
-  status = sl_si91x_gpio_driver_set_pin_direction(DIO1_HP_PORT, DIO1_HP_PIN, 
-                                                   (sl_si91x_gpio_direction_t)GPIO_INPUT);
-  if (status != SL_STATUS_OK) {
-    DEBUGOUT("  sl_si91x_gpio_driver_set_pin_direction failed: 0x%04lX\n", (unsigned long)status);
-    return LR1121_ERROR_GPIO_INIT;
-  }
-  DEBUGOUT("  Pin direction set to INPUT\n");
-  
-  /* Step 4: Configure rising-edge interrupt using SDK
-   * 
+
+  /* Step 5: Explicitly enable an internal PULL-DOWN resistor.
+   * If the LR1121 DIO9 output is floating or open-drain, this ensures
+   * it stays 0V unless driven HIGH.
+   * (sl_si91x_gpio_driver_disable_state_t)2 corresponds to PULLDOWN.
+   */
+  sl_si91x_gpio_driver_select_pad_driver_disable_state(
+      DIO1_HP_GPIO, (sl_si91x_gpio_driver_disable_state_t)2);
+
+  /* Step 7: Configure rising-edge interrupt using SDK
+   *
    * Note: Using rising-edge (not level-high) because:
    * - LR1121 holds DIO1 HIGH until IRQ flags are read
    * - Level-high would cause infinite ISR loop
    * - Rising-edge fires once per LOW→HIGH transition
    */
-  status = sl_gpio_driver_configure_interrupt(&dio1_pin_config.port_pin,
-                                              DIO1_INT_CHANNEL,
-                                              (sl_gpio_interrupt_flag_t)SL_GPIO_INTERRUPT_RISE_EDGE,
-                                              (sl_gpio_irq_callback_t)&dio1_gpio_interrupt_callback,
-                                              (uint32_t *)NULL);
+  status = sl_gpio_driver_configure_interrupt(
+      &dio1_pin_config.port_pin, DIO1_INT_CHANNEL,
+      (sl_gpio_interrupt_flag_t)SL_GPIO_INTERRUPT_RISE_EDGE,
+      (sl_gpio_irq_callback_t)&dio1_gpio_interrupt_callback, (uint32_t *)NULL);
   if (status != SL_STATUS_OK) {
-    DEBUGOUT("  sl_gpio_driver_configure_interrupt failed: 0x%04lX\n", (unsigned long)status);
+    DEBUGOUT("  sl_gpio_driver_configure_interrupt failed: 0x%04lX\n",
+             (unsigned long)status);
     return LR1121_ERROR_GPIO_INIT;
   }
-  DEBUGOUT("  Rising-edge interrupt configured on channel %d\n", DIO1_INT_CHANNEL);
-  
+  DEBUGOUT("  Rising-edge interrupt configured on channel %d\n",
+           DIO1_INT_CHANNEL);
+
   dio1_initialized = true;
-  
+
+  /* Final verification read using SDK */
+  uint8_t sdk_pin_value = 0;
+  sl_gpio_driver_get_pin(&dio1_pin_config.port_pin, &sdk_pin_value);
+  DEBUGOUT("  SDK pin read: GPIO_%d = %d\n", DIO1_HP_GPIO, sdk_pin_value);
+
   DEBUGOUT("LR1121: DIO1 interrupt initialized (currently %s)\n",
-           lr1121_dio1_read() ? "HIGH" : "LOW");
-  
+           sdk_pin_value ? "HIGH" : "LOW");
+
   return LR1121_OK;
 }
 
 /**
  * @brief Enable DIO1 interrupt and allow callbacks
- * 
+ *
  * This should be called AFTER the LR1121 is initialized and its IRQs cleared.
- * At that point, DIO1 should be LOW, and subsequent IRQs will trigger rising edges.
+ * At that point, DIO1 should be LOW, and subsequent IRQs will trigger rising
+ * edges.
  */
-void lr1121_dio1_enable(void)
-{
+void lr1121_dio1_enable(void) {
   if (!dio1_initialized) {
     DEBUGOUT("LR1121: DIO1 not initialized, call lr1121_dio1_init() first\n");
     return;
   }
-  
+
   /* Clear any pending interrupt first */
   sl_gpio_driver_clear_interrupts(1 << DIO1_INT_CHANNEL);
-  
-  /* Enable the pin interrupt */
+
+  /* Enable the pin interrupt with highest priority for ELRS timing */
   uint32_t irqn = EGPIO_PIN_0_IRQn + DIO1_INT_CHANNEL;
+
+  /* Set DIO1 interrupt to safe priority (5) for FreeRTOS compatibility
+   *
+   * CRITICAL: ELRS RX requires immediate response to DIO1 (packet received).
+   * However, FreeRTOS prohibits calling OS APIs from ISRs with priority <
+   * configMAX_SYSCALL_INTERRUPT_PRIORITY (5). If the SDK's GPIO interrupt
+   * dispatcher makes any OS calls, priority 0 will cause a hard fault. Both
+   * CT_IRQn (hwTimer) and DIO1 must be at priority 5.
+   */
+  NVIC_SetPriority((IRQn_Type)irqn, 5);
   NVIC_EnableIRQ((IRQn_Type)irqn);
-  
+
   /* Now allow callbacks to be invoked */
   dio1_callback_enabled = true;
-  
+
   DEBUGOUT("LR1121: DIO1 interrupt enabled on GPIO_%d\n", DIO1_HP_PIN);
 }
 
 /**
  * @brief Disable DIO1 interrupt
  */
-void lr1121_dio1_disable(void)
-{
+void lr1121_dio1_disable(void) {
   if (!dio1_initialized) {
     return;
   }
-  
+
   /* Disable the pin interrupt */
   uint32_t irqn = EGPIO_PIN_0_IRQn + DIO1_INT_CHANNEL;
   NVIC_DisableIRQ((IRQn_Type)irqn);
-  
+
   dio1_callback_enabled = false;
-  
+
   DEBUGOUT("LR1121: DIO1 interrupt disabled\n");
 }
 
 /**
  * @brief Read current state of DIO1 pin
- * 
+ *
+ * Uses direct register access for reliable reading.
+ *
  * @return 1 if DIO1 is HIGH, 0 if LOW
  */
-int lr1121_dio1_read(void)
-{
-  uint8_t pin_value = 0;
-  sl_gpio_driver_get_pin(&dio1_pin_config.port_pin, &pin_value);
-  return (int)pin_value;
+int lr1121_dio1_read(void) {
+  if (dio1_initialized) {
+    uint8_t pin_val = 0;
+    sl_gpio_driver_get_pin(&dio1_pin_config.port_pin, &pin_val);
+    return pin_val;
+  }
+  return 0;
 }
 
 /**
  * @brief Register a callback function for DIO1 interrupts
  */
-void lr1121_dio1_set_callback(lr1121_dio1_callback_t callback)
-{
+void lr1121_dio1_set_callback(lr1121_dio1_callback_t callback) {
   dio1_callback = callback;
-  DEBUGOUT("LR1121: DIO1 callback %s\n", callback ? "registered" : "unregistered");
+  DEBUGOUT("LR1121: DIO1 callback %s\n",
+           callback ? "registered" : "unregistered");
 }
 
 /**
  * @brief SDK GPIO interrupt callback - called by SDK interrupt handler
- * 
+ *
  * For HP GPIO pin interrupts, the flag parameter indicates which interrupt
  * channel fired (bitmask).
  */
-static void dio1_gpio_interrupt_callback(uint32_t flag)
-{
-  dio1_isr_count++;  /* Debug: count all ISR entries */
-  
-  /* Check if this is our interrupt channel */
-  if (flag & (1 << DIO1_INT_CHANNEL)) {
+static void dio1_gpio_interrupt_callback(uint32_t flag) {
+  dio1_isr_count++; /* Debug: count all ISR entries */
+
+  /* Check if this is our interrupt channel
+   * Note: Some SDKs pass the channel index (e.g., 2), others pass a bitmask (1
+   * << 2). We check for both to be safe against SDK variations.
+   */
+  if ((flag == DIO1_INT_CHANNEL) || (flag & (1 << DIO1_INT_CHANNEL))) {
     /* Only call callback if enabled (after LR1121 init clears IRQs) */
     if (dio1_callback_enabled && dio1_callback != NULL) {
       dio1_callback();
@@ -2473,26 +2616,38 @@ static void dio1_gpio_interrupt_callback(uint32_t flag)
  * @brief Get DIO1 ISR count for debugging
  * @return Number of times the DIO1 ISR callback was entered
  */
-uint32_t lr1121_dio1_get_isr_count(void)
-{
-  return dio1_isr_count;
-}
+uint32_t lr1121_dio1_get_isr_count(void) { return dio1_isr_count; }
 
 /**
  * @brief Flash ELRS firmware to LR1121 (stub)
- * 
- * This is a stub function that assumes the ELRS firmware is already 
- * flashed on the LR1121. The actual firmware flashing code was in 
+ *
+ * This is a stub function that assumes the ELRS firmware is already
+ * flashed on the LR1121. The actual firmware flashing code was in
  * lr1121_driver_backup.c but is not needed if firmware is pre-flashed.
- * 
+ *
  * The ELRS firmware provides custom opcodes for optimized packet handling:
  *   - 0x0700 GetPacket - Combined packet retrieval
  *   - 0x0701 SetFreqSetRx - Combined frequency set and RX entry
- * 
+ *
  * @return 0 on success (always returns success as firmware assumed present)
  */
-int lr1121_flash_elrs_firmware(void)
-{
+int lr1121_flash_elrs_firmware(void) {
   DEBUGOUT("[LR1121] ELRS firmware flash skipped (assuming pre-flashed)\n");
-  return 0;  /* Success - firmware already flashed */
+  return 0; /* Success - firmware already flashed */
 }
+
+#ifndef SL_SI91X_GSPI_DMA
+/**
+ * @brief Stub for missing SDK function
+ *
+ * The SiWx917 SDK unified GSPI driver has a bug where
+ * `sl_si91x_gspi_set_configuration` calls `GSPI_WriteDummyByte()`
+ * unconditionally, but the CMSIS `GSPI.c` driver only defines it if
+ * `SL_SI91X_GSPI_DMA` is defined. This stub resolves the linker error when DMA
+ * is disabled to avoid the channel exhaustion leak.
+ */
+void GSPI_WriteDummyByte(void) {
+  // Do nothing. The SDK's original function just performed a dummy transfer.
+  // When not using DMA, the CMSIS CPU polling logic works fine without this.
+}
+#endif
