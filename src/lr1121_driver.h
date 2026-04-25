@@ -66,7 +66,7 @@ extern "C" {
  *
  * Citation: LR1121 Datasheet Section 11.2.5 "SetTcxoMode"
  * Parameters: [Voltage Trim (1 byte)][Delay (3 bytes, in 30.52µs steps)]
- * 
+ *
  * Voltage Trim Values (for Core1121-HF TCXO module):
  *   0x00 = 1.6V
  *   0x01 = 1.7V
@@ -79,7 +79,7 @@ extern "C" {
  *
  * Required for TCXO-based modules to start the oscillator and lock PLL.
  */
-#define LR1121_CMD_SET_TCXO_MODE 0x0117  /* FIX: Was 0x0097 (wrong!) */
+#define LR1121_CMD_SET_TCXO_MODE 0x0117 /* FIX: Was 0x0097 (wrong!) */
 
 /*******************************************************************************
  * LR1121 Firmware Type Constants (Use Case)
@@ -137,7 +137,7 @@ extern "C" {
  *
  * Citation: 61252685.LR1121_V2_1_data_sheet.pdf Section 4.2.1
  * "Minimum reset pulse width is 100µs"
- * 
+ *
  * FIX: Increased from 1ms to 100ms to ensure the LR1121 fully resets
  * from any hung state. Semtech recommends longer reset for stuck chips.
  */
@@ -148,7 +148,7 @@ extern "C" {
  *
  * Citation: LR1121 User Manual Section 6.3.2 "SetTcxoMode"
  * Citation: ExpressLRS GitHub Discussion #3045 - TCXO power sources
- * 
+ *
  * IMPORTANT FIX: Even for externally-powered TCXO modules, SetTcxoMode
  * may still be needed to:
  * 1. Configure the TCXO detection circuitry timing
@@ -162,13 +162,14 @@ extern "C" {
  * Set this to 1 to SKIP SetTcxoMode (only if STANDBY_XOSC works!)
  * Set this to 0 to ENABLE SetTcxoMode (recommended - try this first!)
  */
-#define LR1121_TCXO_EXTERNAL_POWER 0  /* FIX: Enable SetTcxoMode to configure XOSC path */
+#define LR1121_TCXO_EXTERNAL_POWER                                             \
+  0 /* FIX: Enable SetTcxoMode to configure XOSC path */
 
 /**
  * @brief TCXO voltage trim value (only used if LR1121_TCXO_EXTERNAL_POWER == 0)
  *
  * Citation: LR1121 User Manual Section 6.3.2 "SetTcxoMode"
- * 
+ *
  * Voltage Trim Values:
  *   0x00 = 1.6V
  *   0x01 = 1.7V
@@ -189,7 +190,8 @@ extern "C" {
  * with the correct voltage trim to configure the XOSC input path.
  * Use 0x07 (3.3V) to match the external TCXO voltage.
  */
-#define LR1121_TCXO_VOLTAGE_TRIM 0x07  /* 3.3V - matches Core1121-HF external TCXO */
+#define LR1121_TCXO_VOLTAGE_TRIM                                               \
+  0x07 /* 3.3V - matches Core1121-HF external TCXO */
 
 /**
  * @brief TCXO startup delay in 30.52µs steps
@@ -203,7 +205,8 @@ extern "C" {
  */
 #define LR1121_TCXO_DELAY_MS50 0x000666
 #define LR1121_TCXO_DELAY_MS10 0x000148
-#define LR1121_TCXO_DELAY      LR1121_TCXO_DELAY_MS50  /* Use 50ms for reliability */
+#define LR1121_TCXO_DELAY LR1121_TCXO_DELAY_MS50 /* Use 50ms for reliability   \
+                                                  */
 
 /*******************************************************************************
  * Data Structures
@@ -313,7 +316,7 @@ void lr1121_test_communication(void);
  * @brief Send SetTcxoMode command to initialize TCXO oscillator
  *
  * Citation: LR1121 Datasheet Section 11.2.5 "SetTcxoMode"
- * 
+ *
  * Required for TCXO-based modules (like Core1121-HF) to start the
  * oscillator and achieve PLL lock. BUSY will be LOW when PLL is locked.
  *
@@ -393,7 +396,8 @@ bool lr1121_wait_busy_timeout(uint32_t timeout_ms);
  * @param param_len Number of parameter bytes
  * @return true on success
  */
-bool lr1121_send_command(uint16_t opcode, const uint8_t *params, uint16_t param_len);
+bool lr1121_send_command(uint16_t opcode, const uint8_t *params,
+                         uint16_t param_len);
 
 /**
  * @brief Read response from LR1121 (Phase 2 of SPI protocol)
@@ -440,21 +444,21 @@ bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status);
  * @brief LR1121 Chip Mode Constants
  * Citation: LR1121 User Manual Section 2.1
  */
-#define LR1121_CHIP_MODE_SLEEP       0
-#define LR1121_CHIP_MODE_STDBY_RC    1
-#define LR1121_CHIP_MODE_STDBY_XOSC  2
-#define LR1121_CHIP_MODE_FS          3
-#define LR1121_CHIP_MODE_RX          4
-#define LR1121_CHIP_MODE_TX          5
+#define LR1121_CHIP_MODE_SLEEP 0
+#define LR1121_CHIP_MODE_STDBY_RC 1
+#define LR1121_CHIP_MODE_STDBY_XOSC 2
+#define LR1121_CHIP_MODE_FS 3
+#define LR1121_CHIP_MODE_RX 4
+#define LR1121_CHIP_MODE_TX 5
 
 /**
  * @brief LR1121 Command Status Constants
  * Citation: LR1121 User Manual Section 2.1
  */
-#define LR1121_CMD_STATUS_FAIL       0
-#define LR1121_CMD_STATUS_PERR       1
-#define LR1121_CMD_STATUS_SPI_ERR    2
-#define LR1121_CMD_STATUS_OK         3
+#define LR1121_CMD_STATUS_FAIL 0
+#define LR1121_CMD_STATUS_PERR 1
+#define LR1121_CMD_STATUS_SPI_ERR 2
+#define LR1121_CMD_STATUS_OK 3
 #define LR1121_CMD_STATUS_DATA_AVAIL 4
 
 /**
@@ -473,10 +477,11 @@ bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status);
 
 /*******************************************************************************
  * Raw SPI Functions for Single-Phase Commands
- * 
- * These functions are exposed for commands like GetTemperature and GetRandomNumber
- * that require single-phase SPI transactions (response returned during command).
- * 
+ *
+ * These functions are exposed for commands like GetTemperature and
+ * GetRandomNumber that require single-phase SPI transactions (response returned
+ * during command).
+ *
  * Citation: LR1121 User Manual - Some commands return data during the command
  * transaction itself, not in a separate Phase 2 NOP read.
  ******************************************************************************/
@@ -502,53 +507,56 @@ void lr1121_cs_deassert(void);
  * @param length Number of bytes to transfer
  * @return true on success, false on error
  */
-bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data, uint16_t length);
+bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
+                         uint16_t length);
 
 /*******************************************************************************
  * Firmware Version Structure (for OTA updates)
- * 
+ *
  * Note: If lr1121_hal.h is included first, it defines this type.
  * This guards against duplicate definition.
  ******************************************************************************/
-#ifndef LR1121_HAL_H  /* Only define if lr1121_hal.h not included */
+#ifndef LR1121_HAL_H /* Only define if lr1121_hal.h not included */
 typedef struct {
-    uint8_t  hardware;      /* Hardware version */
-    uint8_t  type;          /* Firmware type (0x03=LR1121, 0xDF=Bootloader) */
-    uint16_t version;       /* Firmware version (e.g., 0x0104 = v1.4) */
+  uint8_t hardware; /* Hardware version */
+  uint8_t type;     /* Firmware type (0x03=LR1121, 0xDF=Bootloader) */
+  uint16_t version; /* Firmware version (e.g., 0x0104 = v1.4) */
 } lr1121_firmware_version_t;
 #endif
 
 /*******************************************************************************
  * Bootloader Command Opcodes for Firmware Updates
- * 
+ *
  * Note: Primary definitions are in elrs_protocol/lr1121_regs.h
  * These are provided here as fallbacks if lr1121_regs.h isn't included.
  ******************************************************************************/
 /* Use raw values - don't define macros that conflict with lr1121_regs.h enum */
-#define LR1121_OPCODE_GET_VERSION         0x0101  /* Normal mode GetVersion */
-#define LR1121_OPCODE_BL_GET_VERSION      0x8000  /* Bootloader GetVersion */
-#define LR1121_OPCODE_BL_ERASE_FLASH      0x8001  /* Erase flash */
-#define LR1121_OPCODE_BL_WRITE_FLASH      0x8003  /* Write encrypted flash */
-#define LR1121_OPCODE_BL_REBOOT           0x8005  /* Reboot to app */
+#define LR1121_OPCODE_GET_VERSION 0x0101    /* Normal mode GetVersion */
+#define LR1121_OPCODE_BL_GET_VERSION 0x0101 /* Bootloader GetVersion (same opcode as app mode) */
+#define LR1121_OPCODE_BL_ERASE_FLASH 0x8000 /* Erase flash */
+#define LR1121_OPCODE_BL_WRITE_FLASH 0x8003 /* Write encrypted flash */
+#define LR1121_OPCODE_BL_REBOOT 0x8005      /* Reboot to app */
 
 /*******************************************************************************
  * Firmware Update Functions
- * 
+ *
  * Citation: ExpressLRS LR1121.cpp firmware update implementation
  ******************************************************************************/
 
 /**
  * @brief Get firmware version using specified command opcode
- * 
+ *
  * @param version Output structure for version info
- * @param opcode Command opcode (LR11XX_SYSTEM_GET_VERSION_OC or LR11XX_BL_GET_VERSION_OC)
+ * @param opcode Command opcode (LR11XX_SYSTEM_GET_VERSION_OC or
+ * LR11XX_BL_GET_VERSION_OC)
  * @return true on success, false on failure
  */
-bool lr1121_get_firmware_version(lr1121_firmware_version_t *version, uint16_t opcode);
+bool lr1121_get_firmware_version(lr1121_firmware_version_t *version,
+                                 uint16_t opcode);
 
 /**
  * @brief Begin firmware update (enters bootloader, erases flash)
- * 
+ *
  * @param expected_size Expected total firmware size in bytes
  * @return 0 on success, negative error code on failure
  */
@@ -556,7 +564,7 @@ int lr1121_begin_update(uint32_t expected_size);
 
 /**
  * @brief Write firmware data bytes to LR1121 flash
- * 
+ *
  * @param data Pointer to data buffer
  * @param size Number of bytes to write
  * @return 0 on success, negative error code on failure
@@ -565,14 +573,14 @@ int lr1121_write_update_bytes(const uint8_t *data, uint32_t size);
 
 /**
  * @brief End firmware update (reboot to new firmware)
- * 
+ *
  * @return 0 on success, negative error code on failure
  */
 int lr1121_end_update(void);
 
 /*******************************************************************************
  * DIO1 Interrupt Functions
- * 
+ *
  * Citation: LR1121 Datasheet - DIO1 is used for IRQ signaling
  * Connected to SiW917 UULP_VBAT_GPIO_2 on BRD2708A
  ******************************************************************************/
@@ -607,6 +615,16 @@ void lr1121_dio1_enable(void);
  * @brief Disable DIO1 NVIC interrupt
  */
 void lr1121_dio1_disable(void);
+
+/**
+ * @brief Pause DIO1 NVIC interrupt (for SPI re-entrancy)
+ */
+void lr1121_dio1_pause_isr(void);
+
+/**
+ * @brief Resume DIO1 NVIC interrupt (for SPI re-entrancy)
+ */
+void lr1121_dio1_resume_isr(void);
 
 /**
  * @brief Get DIO1 ISR count for debugging

@@ -1706,9 +1706,14 @@ lr1121_status_t lr1121_waveshare_init(void) {
   DEBUGOUT("\n");
 
   /* =========================================================================
-   * STEP 9: SetDioAsRfSwitch (PE4259)
+   * STEP 9: SetDioAsRfSwitch (PE4259) — sub-GHz only.
+   * On 2.4 GHz the LR1121 uses RFIO_HF with internal TX/RX switching,
+   * so no external switch is programmed (DIO5/DIO6 stay idle).
    * =========================================================================
    */
+#if LR1121_BAND_24GHZ
+  DEBUGOUT("STEP 9: SetDioAsRfSwitch SKIPPED (2.4 GHz, no ext switch)\n\n");
+#else
   DEBUGOUT("STEP 9: SetDioAsRfSwitch [0x0112]\n");
   if (!lr1121_wait_busy_timeout(100)) {
     return LR1121_ERROR_BUSY_TIMEOUT;
@@ -1731,16 +1736,25 @@ lr1121_status_t lr1121_waveshare_init(void) {
     return LR1121_ERROR_BUSY_TIMEOUT;
   }
   DEBUGOUT("  OK SetDioAsRfSwitch complete\n\n");
+#endif
 
   /* =========================================================================
-   * STEP 10: CalibrateImage for 915MHz band
+   * STEP 10: CalibrateImage for configured band
+   * Citation: LR1121 Datasheet "CalibrateImage"
+   *   915 MHz: freq1=0xE1, freq2=0xE9   (902–928 MHz)
+   *   2.4 GHz: freq1=0x94, freq2=0x98   (per ELRS LR1121.cpp lookup)
    * =========================================================================
    */
+#if LR1121_BAND_24GHZ
+  DEBUGOUT("STEP 10: CalibrateImage(2.4GHz) [0x0111]\n");
+  uint8_t calib_img[2] = {0x94, 0x98};
+#else
   DEBUGOUT("STEP 10: CalibrateImage(915MHz) [0x0111]\n");
+  uint8_t calib_img[2] = {0xE1, 0xE9};
+#endif
   if (!lr1121_wait_busy_timeout(100)) {
     return LR1121_ERROR_BUSY_TIMEOUT;
   }
-  uint8_t calib_img[2] = {0xE1, 0xE9}; /* 915MHz band */
   if (!lr1121_send_command(0x0111, calib_img, 2)) {
     DEBUGOUT("  X FAILED\n");
     return LR1121_ERROR_SPI_INIT;

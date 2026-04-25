@@ -18,6 +18,7 @@
 #include "LQCALC.h"
 #include "LR1121.h"
 #include "LR1121Driver.h"
+#include "LR1121_hal.h"
 #include "LowPassFilter.h"
 #include "OTA.h"
 #include "PFD.h"
@@ -27,8 +28,10 @@
 #include "hwTimer.h"
 #include "logging.h"
 #include "options.h"
+#include "stubborn_receiver.h"
 #include "stubborn_sender.h"
 #include "telemetry_protocol.h"
+#include "msptypes.h"
 
 // Standard includes
 #include <string.h>
@@ -40,6 +43,11 @@ extern "C" {
 #include "elrs_config.h"
 #include "status_led.h"
 #include "wifi_http_test.h"
+void elrs_cpp_request_wifi_mode(void);
+int lr1121_dio1_read(void);
+void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
+                          uint32_t *tx_count, uint32_t *other_count,
+                          uint32_t *last_irq);
 }
 
 //// CONSTANTS ////
@@ -47,6 +55,8 @@ extern "C" {
 #define PACKET_TO_TOCK_SLACK                                                   \
   200 // Desired buffer time between Packet ISR and Tock ISR
 #define CRSF_RC_OUTPUT_INTERVAL 4 // Output RC channels every 4ms (~250Hz)
+#define RFmodeCycleMultiplierSlow 10
+#define BindingRateChangeCyclePeriodMs 125U
 ///////////////////
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
@@ -112,6 +122,9 @@ uint32_t LastSyncPacket = 0;
 static uint32_t RFmodeLastCycled = 0;
 static uint8_t RFmodeCycleMultiplier = 1;
 static bool LockRFmode = false;
+static int8_t SwitchModePending = 0;
+static tx_transmission_mode_e TxOtaProtocol = TX_NORMAL_MODE;
+static bool warnedUnsupportedTxProtocol = false;
 
 // Rate/mode scanning
 static uint8_t scanIndex = 0;
@@ -134,10 +147,17 @@ uint32_t cycleInterval = 0;
 
 // Telemetry TX (downlink to TX module)
 StubbornSender TelemetrySender;
+StubbornReceiver DataUlReceiver;
 static uint8_t TelemetryBuffer[ELRS_DATA_UL_BUFFER];
+static uint8_t DataUlBuffer[ELRS_DATA_UL_BUFFER];
 static uint8_t NextTelemetryType = PACKET_TYPE_LINKSTATS;
 static uint8_t telemetryBurstCount = 0;
 static uint8_t telemetryBurstMax = 1;
+static bool telemBurstValid = false;
+static bool alreadyTLMresp = false;
+static volatile bool dataUlReady = false;
+static volatile bool uidSavePending = false;
+static uint8_t pendingUid[UID_LEN] = {0};
 
 // SNR accumulator for telemetry (simplified - just use last value)
 static int8_t lastSnrRaw = 0;
@@ -183,10 +203,27 @@ static void SetRFLinkRate(uint8_t index, bool bindMode);
 extern bool SerialrxUpdatePacketComplete; // This seems to be a new declaration
 
 // Hardware interrupt flags from LR1121_hal.cpp
-extern volatile uint32_t isr_1_pending_count;
-extern volatile uint32_t isr_2_pending_count;
+extern volatile uint32_t isr_1_total_count;
 
 static void ICACHE_RAM_ATTR getRFlinkInfo();
+static void ICACHE_RAM_ATTR HWtimerCallbackTick();
+static void ICACHE_RAM_ATTR HWtimerCallbackTock();
+static void ICACHE_RAM_ATTR HandleFHSS();
+static void ICACHE_RAM_ATTR updatePhaseLock();
+static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now);
+static void GotConnection(unsigned long now);
+static void LostConnection(bool resumeRx);
+static uint8_t minLqForChaos();
+static void updateBindingMode(unsigned long now);
+static void LinkStatsToOta(OTA_LinkStats_s *ls);
+static bool ICACHE_RAM_ATTR HandleSendDataDl();
+static void updateTelemetryBurst();
+static void ICACHE_RAM_ATTR updateSwitchModePendingFromOta(uint8_t newSwitchMode);
+static void updateSwitchMode();
+static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4);
+static void ICACHE_RAM_ATTR ProcessRfPacket_DataUl(
+    OTA_Packet_s const *const otaPktPtr);
+static void DataUlReceiveComplete();
 
 //=============================================================================
 // Channel data initialization
@@ -203,6 +240,12 @@ void ChannelDataReset() {
 uint32_t uidMacSeedGet() {
   return ((uint32_t)UID[2] << 24) | ((uint32_t)UID[3] << 16) |
          ((uint32_t)UID[4] << 8) | UID[5];
+}
+
+static bool use2G4Domain(void) { return firmwareOptions.domain >= 8; }
+
+static uint8_t getStartupOrBindingRateIndex(void) {
+  return enumRatetoIndex(use2G4Domain() ? RATE_LORA_2G4_50HZ : RATE_BINDING);
 }
 
 //=============================================================================
@@ -232,6 +275,154 @@ static void ICACHE_RAM_ATTR getRFlinkInfo() {
   linkStats.rf_Mode = ExpressLRS_currAirRate_Modparams->enum_rate;
 }
 
+static uint8_t minLqForChaos() {
+  const uint32_t numfhss = FHSSgetChannelCount();
+  const uint8_t interval = ExpressLRS_currAirRate_Modparams->FHSShopInterval;
+  return interval * ((interval * numfhss + 99) / (interval * numfhss));
+}
+
+static void LinkStatsToOta(OTA_LinkStats_s *ls) {
+  if (ls == nullptr) {
+    return;
+  }
+
+  ls->uplink_RSSI_1 = linkStats.uplink_RSSI_1;
+  ls->uplink_RSSI_2 = linkStats.uplink_RSSI_2;
+  ls->antenna = antenna;
+  ls->modelMatch = connectionHasModelMatch;
+  ls->lq = uplinkLQ;
+  ls->trueDiversityAvailable = 0;
+  ls->SNR = lastSnrRaw;
+}
+
+static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4) {
+  UID[0] = 0;
+  UID[1] = 0;
+  for (unsigned i = 0; i < 4; i++) {
+    UID[i + 2] = newUid4[i];
+  }
+
+  memcpy(firmwareOptions.uid, UID, UID_LEN);
+  memcpy(pendingUid, UID, UID_LEN);
+  uidSavePending = true;
+
+  DBGLN("New UID from MSP bind = %u,%u,%u,%u,%u,%u", UID[0], UID[1], UID[2],
+        UID[3], UID[4], UID[5]);
+}
+
+static void ICACHE_RAM_ATTR updatePhaseLock() {
+  if (connectionState != disconnected && PFDloop.hasResult()) {
+    int32_t rawOffset = PFDloop.calcResult();
+    int32_t offset = LPF_Offset.update(rawOffset);
+    int32_t offsetDx = LPF_OffsetDx.update(rawOffset - PfdPrevRawOffset);
+    PfdPrevRawOffset = rawOffset;
+
+    if (RXtimerState == tim_locked && (OtaNonce % 8 == 0)) {
+      if (offset > 0) {
+        hwTimer::incFreqOffset();
+      } else if (offset < 0) {
+        hwTimer::decFreqOffset();
+      }
+    }
+
+    if (connectionState != connected) {
+      hwTimer::phaseShift(rawOffset >> 1);
+    } else {
+      hwTimer::phaseShift(offset >> 2);
+    }
+
+    (void)offsetDx;
+  }
+
+  PFDloop.reset();
+}
+
+static void ICACHE_RAM_ATTR HandleFHSS() {
+  if (ExpressLRS_currAirRate_Modparams == nullptr) {
+    return;
+  }
+
+  uint8_t modresultFHSS =
+      OtaNonce % ExpressLRS_currAirRate_Modparams->FHSShopInterval;
+
+  if ((ExpressLRS_currAirRate_Modparams->FHSShopInterval == 0) ||
+      InBindingMode || (modresultFHSS != 0) ||
+      (connectionState == disconnected)) {
+    return;
+  }
+
+  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, false);
+}
+
+static void ICACHE_RAM_ATTR HWtimerCallbackTick() {
+  uplinkLQ = LQCalc.getLQ();
+  linkStats.uplink_Link_quality = uplinkLQ;
+  if (!alreadyTLMresp) {
+    LQCalc.inc();
+  }
+  alreadyTLMresp = false;
+}
+
+static void ICACHE_RAM_ATTR HWtimerCallbackTock() {
+  PFDloop.intEvent(micros());
+  OtaNonce++;
+  HandleFHSS();
+  (void)HandleSendDataDl();
+  updatePhaseLock();
+}
+
+static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now) {
+  PFDloop.reset();
+  setConnectionState(tentative);
+  connectionHasModelMatch = false;
+  RXtimerState = tim_disconnected;
+  PfdPrevRawOffset = 0;
+  GotConnectionMillis = 0;
+  LPF_Offset.init(0);
+  LPF_OffsetDx.init(0);
+  alreadyTLMresp = false;
+  RFmodeLastCycled = now;
+}
+
+static void GotConnection(unsigned long now) {
+  if (connectionState == connected) {
+    return;
+  }
+
+  LockRFmode = firmwareOptions.lock_on_first_connection;
+  setConnectionState(connected);
+  RXtimerState = tim_tentative;
+  GotConnectionMillis = now;
+}
+
+static void LostConnection(bool resumeRx) {
+  setConnectionState(disconnected);
+  RXtimerState = tim_disconnected;
+  PfdPrevRawOffset = 0;
+  GotConnectionMillis = 0;
+  uplinkLQ = 0;
+  connectionHasModelMatch = false;
+  LQCalc.reset();
+  LPF_Offset.init(0);
+  LPF_OffsetDx.init(0);
+  alreadyTLMresp = false;
+  SwitchModePending = 0;
+  dataUlReady = false;
+  DataUlReceiver.ResetState();
+
+  if (hwTimer::isRunning()) {
+    hwTimer::stop();
+  }
+  hwTimer::resetFreqOffset();
+
+  if (!InBindingMode) {
+    SetRFLinkRate(ExpressLRS_nextAirRateIndex, false);
+    if (resumeRx) {
+      Radio.RXnb();
+    }
+  }
+}
+
 //=============================================================================
 // Connection state management
 //=============================================================================
@@ -239,6 +430,21 @@ static void ICACHE_RAM_ATTR getRFlinkInfo() {
 //=============================================================================
 // Process SYNC packet
 //=============================================================================
+static void ICACHE_RAM_ATTR updateSwitchModePendingFromOta(uint8_t newSwitchMode) {
+  if (OtaSwitchModeCurrent == newSwitchMode) {
+    SwitchModePending = 0;
+    return;
+  }
+
+  int8_t newSwitchModePending = -(int8_t)newSwitchMode - 1;
+  if ((connectionState == disconnected) ||
+      (SwitchModePending == newSwitchModePending)) {
+    SwitchModePending = (int8_t)newSwitchMode + 1;
+  } else {
+    SwitchModePending = newSwitchModePending;
+  }
+}
+
 static bool ICACHE_RAM_ATTR
 ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
   // Verify the binding ID
@@ -250,9 +456,23 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
 
   LastSyncPacket = now;
 
+  TxOtaProtocol = (otaSync->otaProtocol == TX_MAVLINK_MODE)
+                      ? TX_MAVLINK_MODE
+                      : TX_NORMAL_MODE;
+  if ((TxOtaProtocol == TX_MAVLINK_MODE) && !warnedUnsupportedTxProtocol) {
+    warnedUnsupportedTxProtocol = true;
+    DBGLN("TX requested MAVLink OTA mode; CRSF RC output remains unsupported");
+  } else if ((TxOtaProtocol == TX_NORMAL_MODE) && warnedUnsupportedTxProtocol) {
+    warnedUnsupportedTxProtocol = false;
+    DBGLN("TX returned to normal OTA mode");
+  }
+
+  geminiMode = otaSync->geminiMode;
+
   // Will change the packet air rate in loop() if this changes
   ExpressLRS_nextAirRateIndex =
       enumRatetoIndex((expresslrs_RFrates_e)otaSync->rfRateEnum);
+  updateSwitchModePendingFromOta(otaSync->switchEncMode);
 
   // Update TLM ratio
   expresslrs_tlm_ratio_e TLMrateIn =
@@ -262,6 +482,7 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
   if (ExpressLRS_currTlmDenom != TlmDenom) {
     DBGLN("New TLMrate 1:%u", TlmDenom);
     ExpressLRS_currTlmDenom = TlmDenom;
+    telemBurstValid = false;
   }
 
   // Model match check
@@ -275,6 +496,7 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
       connectionHasModelMatch != modelMatched) {
     FHSSsetCurrIndex(otaSync->fhssIndex);
     OtaNonce = otaSync->nonce;
+    TentativeConnection(now);
     connectionHasModelMatch = modelMatched;
     return true;
   }
@@ -287,9 +509,47 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
 //=============================================================================
 static void ICACHE_RAM_ATTR
 ProcessRfPacket_RC(OTA_Packet_s const *const otaPktPtr) {
+  if ((connectionState != connected) || SwitchModePending) {
+    return;
+  }
+
+  bool telemetryConfirmValue = OtaUnpackChannelData(otaPktPtr, ChannelData);
+  TelemetrySender.ConfirmCurrentPayload(telemetryConfirmValue);
+
   // Notify callback if registered
   if (connectionHasModelMatch && channelCallback) {
     channelCallback(ChannelData, CRSF_NUM_CHANNELS);
+  }
+}
+
+static void ICACHE_RAM_ATTR
+ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
+  uint8_t packageIndex;
+  uint8_t const *payload;
+  uint8_t dataLen;
+
+  if (OtaIsFullRes) {
+    packageIndex = otaPktPtr->full.data_ul.packageIndex;
+    payload = otaPktPtr->full.data_ul.payload;
+    dataLen = sizeof(otaPktPtr->full.data_ul.payload);
+  } else {
+    packageIndex = otaPktPtr->std.data_ul.packageIndex;
+    payload = otaPktPtr->std.data_ul.payload;
+    dataLen = sizeof(otaPktPtr->std.data_ul.payload);
+  }
+
+  if (InBindingMode && packageIndex == 1 && payload[0] == MSP_ELRS_BIND) {
+    OnELRSBindMSP((uint8_t *)&payload[1]);
+    return;
+  }
+
+  if (connectionState != connected) {
+    return;
+  }
+
+  DataUlReceiver.ReceiveData(packageIndex, payload, dataLen);
+  if (DataUlReceiver.HasFinishedData()) {
+    dataUlReady = true;
   }
 }
 
@@ -308,6 +568,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
     return false;
   }
 
+  uint32_t const beginProcessing = micros();
   uint32_t const now = millis();
 
   OTA_Packet_s *const otaPktPtr = (OTA_Packet_s *const)Radio.RXdataBuffer;
@@ -315,23 +576,22 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   // Validate CRC
   if (!OtaValidatePacketCrc(otaPktPtr)) {
     crcFailCount++;
-    // Print comprehensive CRC debug info
-    uint8_t type = Radio.RXdataBuffer[0] & 0x03;
-    uint8_t crcHigh = (Radio.RXdataBuffer[0] >> 2) & 0x3F;
-    uint8_t crcLow = Radio.RXdataBuffer[7];
-    uint16_t inCRC = ((uint16_t)crcHigh << 8) | crcLow;
-    DBGLN("CRC FAIL #%lu: type=%d inCRC=0x%04X (H=0x%02X L=0x%02X)",
-          crcFailCount, type, inCRC, crcHigh, crcLow);
-    DBGLN("  RAW[8]: %02X %02X %02X %02X %02X %02X %02X %02X",
-          Radio.RXdataBuffer[0], Radio.RXdataBuffer[1], Radio.RXdataBuffer[2],
-          Radio.RXdataBuffer[3], Radio.RXdataBuffer[4], Radio.RXdataBuffer[5],
-          Radio.RXdataBuffer[6], Radio.RXdataBuffer[7]);
-    DBGLN("  OtaCrcInit=0x%04X, Nonce=%d, FullRes=%d", OtaCrcInitializer,
-          OtaNonce, OtaIsFullRes);
     return false;
   }
 
   crcPassCount++;
+
+  if (ExpressLRS_currAirRate_Modparams != nullptr &&
+      ExpressLRS_currAirRate_RFperfParams != nullptr) {
+    int32_t slack = PACKET_TO_TOCK_SLACK;
+    int32_t toaSlack =
+        (int32_t)ExpressLRS_currAirRate_Modparams->interval -
+        (2 * (int32_t)ExpressLRS_currAirRate_RFperfParams->TOA);
+    if (toaSlack > slack) {
+      slack = toaSlack;
+    }
+    PFDloop.extEvent(beginProcessing + slack);
+  }
 
   // Get packet type (low 2 bits of first byte)
   uint8_t const type = Radio.RXdataBuffer[0] & 0x03;
@@ -346,9 +606,12 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   // Update link quality and RSSI
   LQCalc.add();
   getRFlinkInfo();
+  RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
 
   // Record valid packet time
   LastValidPacket = now;
+
+  doStartTimer = false;
 
   // Handle packet based on type
   switch (type) {
@@ -359,13 +622,19 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   case PACKET_TYPE_SYNC: {
     OTA_Sync_s const *const sync =
         OtaIsFullRes ? &otaPktPtr->full.sync.sync : &otaPktPtr->std.sync;
-    ProcessRfPacket_SYNC(now, sync);
+    doStartTimer = ProcessRfPacket_SYNC(now, sync) && !InBindingMode;
     break;
   }
 
   case PACKET_TYPE_DATA:
-    // MSP/Data packets - not implemented for basic RX
+    ProcessRfPacket_DataUl(otaPktPtr);
     break;
+  }
+
+  if ((connectionState == tentative) && (LPF_OffsetDx.value() <= 10) &&
+      (LPF_OffsetDx.value() >= -10) && (LPF_Offset.value() < 100) &&
+      (LQCalc.getLQRaw() > minLqForChaos())) {
+    GotConnection(now);
   }
 
   return true;
@@ -375,7 +644,15 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
 // Radio ISR callbacks
 //=============================================================================
 static bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
-  return ProcessRFPacket(rxStatus);
+  if (ProcessRFPacket(rxStatus)) {
+    if (doStartTimer && !hwTimer::isRunning()) {
+      doStartTimer = false;
+      hwTimer::resume();
+    }
+    return true;
+  }
+
+  return false;
 }
 
 static void ICACHE_RAM_ATTR TXdoneISR() {
@@ -397,6 +674,9 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
 
   // Binding always uses invertIQ
   bool invertIQ = bindMode || (UID[5] & 0x01);
+  // DIAGNOSTIC: force invertIQ=1 to match standalone RX test (which receives
+  // packets from the bench TX). Revert once UID/bind state is confirmed.
+  invertIQ = true;
 
   uint32_t interval = ModParams->interval;
   hwTimer::updateInterval(interval);
@@ -430,15 +710,136 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   ExpressLRS_currAirRate_Modparams = ModParams;
   ExpressLRS_currAirRate_RFperfParams = RFperf;
   ExpressLRS_nextAirRateIndex = index;
+  telemBurstValid = false;
 
   DBGLN("Set RF rate index %d, interval %lu us", index, interval);
+}
+
+static bool ICACHE_RAM_ATTR HandleSendDataDl() {
+  if ((connectionState == disconnected) || (ExpressLRS_currTlmDenom == 1) ||
+      alreadyTLMresp || !teamraceHasModelMatch ||
+      ((OtaNonce % ExpressLRS_currTlmDenom) != 0)) {
+    return false;
+  }
+
+  WORD_ALIGNED_ATTR OTA_Packet_s otaPkt = {};
+  alreadyTLMresp = true;
+
+  bool tlmQueued = TelemetrySender.IsActive();
+  if ((NextTelemetryType == PACKET_TYPE_LINKSTATS) || !tlmQueued) {
+    otaPkt.std.type = PACKET_TYPE_LINKSTATS;
+
+    if (OtaIsFullRes) {
+      otaPkt.full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+      otaPkt.full.data_dl.packageIndex = TelemetrySender.GetCurrentPayload(
+          otaPkt.full.data_dl.ul_link_stats.payload,
+          sizeof(otaPkt.full.data_dl.ul_link_stats.payload));
+      LinkStatsToOta(&otaPkt.full.data_dl.ul_link_stats.stats);
+    } else {
+      otaPkt.std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+      otaPkt.std.data_dl.packageIndex = TelemetrySender.GetCurrentPayload(
+          otaPkt.std.data_dl.ul_link_stats.payload,
+          sizeof(otaPkt.std.data_dl.ul_link_stats.payload));
+      LinkStatsToOta(&otaPkt.std.data_dl.ul_link_stats.stats);
+    }
+
+    NextTelemetryType = PACKET_TYPE_DATA;
+    telemetryBurstCount = 1;
+  } else {
+    if (telemetryBurstCount < telemetryBurstMax) {
+      telemetryBurstCount++;
+    } else {
+      NextTelemetryType = PACKET_TYPE_LINKSTATS;
+    }
+
+    otaPkt.std.type = PACKET_TYPE_DATA;
+    if (OtaIsFullRes) {
+      otaPkt.full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+      otaPkt.full.data_dl.packageIndex = TelemetrySender.GetCurrentPayload(
+          otaPkt.full.data_dl.payload, sizeof(otaPkt.full.data_dl.payload));
+    } else {
+      otaPkt.std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+      otaPkt.std.data_dl.packageIndex = TelemetrySender.GetCurrentPayload(
+          otaPkt.std.data_dl.payload, sizeof(otaPkt.std.data_dl.payload));
+    }
+  }
+
+  OtaGeneratePacketCrc(&otaPkt);
+  Radio.TXnb((uint8_t *)&otaPkt, false, nullptr, SX12XX_Radio_All);
+  return true;
+}
+
+static void updateTelemetryBurst() {
+  if (telemBurstValid || (ExpressLRS_currAirRate_Modparams == nullptr) ||
+      (ExpressLRS_currTlmDenom == 0)) {
+    return;
+  }
+
+  telemBurstValid = true;
+  uint16_t hz = 1000000 / ExpressLRS_currAirRate_Modparams->interval;
+  telemetryBurstMax = TLMBurstMaxForRateRatio(hz, ExpressLRS_currTlmDenom);
+  TelemetrySender.UpdateTelemetryRate(hz, ExpressLRS_currTlmDenom,
+                                      telemetryBurstMax);
+}
+
+static void updateSwitchMode() {
+  if ((SwitchModePending <= 0) || (ExpressLRS_currAirRate_Modparams == nullptr)) {
+    return;
+  }
+
+  OtaUpdateSerializers((OtaSwitchMode_e)(SwitchModePending - 1),
+                       ExpressLRS_currAirRate_Modparams->PayloadLength);
+  SwitchModePending = 0;
+}
+
+static void DataUlReceiveComplete() {
+  switch (DataUlBuffer[0]) {
+  case MSP_ELRS_SET_RX_WIFI_MODE:
+    elrs_cpp_request_wifi_mode();
+    break;
+  case MSP_ELRS_BIND:
+    if (InBindingMode) {
+      OnELRSBindMSP(&DataUlBuffer[1]);
+    }
+    break;
+  case MSP_ELRS_MAVLINK_TLM:
+    if (TxOtaProtocol == TX_MAVLINK_MODE) {
+      uint32_t mavlinkLen = DataUlBuffer[1];
+      if ((mavlinkLen > 0) &&
+          ((mavlinkLen + CRSF_FRAME_NOT_COUNTED_BYTES) <= sizeof(DataUlBuffer)) &&
+          crsf_serial_is_ready()) {
+        (void)crsf_serial_send_frame(&DataUlBuffer[CRSF_FRAME_NOT_COUNTED_BYTES],
+                                     mavlinkLen);
+      }
+    }
+    break;
+  default:
+    if ((TxOtaProtocol == TX_NORMAL_MODE) && crsf_serial_is_ready()) {
+      const crsf_header_t *receivedHeader =
+          reinterpret_cast<const crsf_header_t *>(DataUlBuffer);
+      uint32_t frameLen =
+          receivedHeader->frame_size + CRSF_FRAME_NOT_COUNTED_BYTES;
+      if (frameLen >= CRSF_MIN_PACKET_LEN && frameLen <= CRSF_MAX_PACKET_LEN) {
+        (void)crsf_serial_send_frame(DataUlBuffer, frameLen);
+      } else {
+        DBGLN("Ignoring malformed UL CRSF frame len=%lu",
+              (unsigned long)frameLen);
+      }
+    }
+    break;
+  }
+
+  DataUlReceiver.Unlock();
+  dataUlReady = false;
 }
 
 //=============================================================================
 // Rate cycling for connection scanning
 //=============================================================================
+static bool rateCyclingStarted = false;
+
 static void cycleRfMode() {
-  if (LockRFmode)
+  if (LockRFmode || InBindingMode)
     return;
 
   uint32_t now = millis();
@@ -453,8 +854,39 @@ static void cycleRfMode() {
 
     SetRFLinkRate(scanIndex, InBindingMode);
     Radio.RXnb();
+    RFmodeCycleMultiplier = 1;
 
     DBGLN("Cycling to rate index %d", scanIndex);
+
+    // Enable per-iteration diagnostics in elrs_loop to catch hang
+    rateCyclingStarted = true;
+  }
+}
+
+static void updateBindingMode(unsigned long now) {
+  static uint32_t bindingRateChangeMs = 0;
+
+  if (!InBindingMode || !ExpressLRS_currAirRate_Modparams) {
+    return;
+  }
+
+  if (use2G4Domain()) {
+    return;
+  }
+
+  if ((now - bindingRateChangeMs) > BindingRateChangeCyclePeriodMs) {
+    bindingRateChangeMs = now;
+
+    uint8_t bindingIndex = enumRatetoIndex(RATE_BINDING);
+    uint8_t dualBandBindingIndex = enumRatetoIndex(RATE_DUALBAND_BINDING);
+
+    if (ExpressLRS_currAirRate_Modparams->enum_rate == RATE_DUALBAND_BINDING) {
+      SetRFLinkRate(bindingIndex, true);
+    } else {
+      SetRFLinkRate(dualBandBindingIndex, true);
+    }
+
+    Radio.RXnb();
   }
 }
 
@@ -535,6 +967,9 @@ bool elrs_init(void) {
 
   // Initialize channel data
   ChannelDataReset();
+  memset(DataUlBuffer, 0, sizeof(DataUlBuffer));
+  DataUlReceiver.setMaxPackageIndex(ELRS_MSP_MAX_PACKAGES);
+  DataUlReceiver.SetDataToReceive(DataUlBuffer, sizeof(DataUlBuffer));
 
   // NOTE: Do NOT call radioHal.init() here!
   // Radio.Begin() below calls hal.init() which does the full init sequence.
@@ -568,13 +1003,15 @@ bool elrs_init(void) {
     LR1121Hal::instance->IsrCallback_2 = LR1121Driver::IsrCallback_2;
   }
 
-  // Set initial rate (start with binding rate for scan - slowest for best
-  // range)
-  scanIndex = RATE_BINDING;
+  hwTimer::init(HWtimerCallbackTick, HWtimerCallbackTock);
+
+  // Start on the slowest rate in the selected band for reliable acquisition.
+  scanIndex = getStartupOrBindingRateIndex();
   SetRFLinkRate(scanIndex, false);
 
   // Start receiving
   Radio.RXnb();
+  DBGLN("Radio.RXnb() called - LR1121 should be in continuous RX mode");
 
   // Record start time for rate cycling
   RFmodeLastCycled = millis();
@@ -600,15 +1037,9 @@ bool elrs_init(void) {
 }
 
 void elrs_loop(void) {
-  // Process Deferred Hardware Interrupts early
-  while (isr_1_pending_count > 0) {
-    isr_1_pending_count--;
-    Radio.IsrCallback_1();
-  }
-  while (isr_2_pending_count > 0) {
-    isr_2_pending_count--;
-    Radio.IsrCallback_2();
-  }
+  // CRITICAL: Process deferred DIO1 interrupts in main-loop context.
+  // The ISR only sets a flag (no SPI). We process it here where SPI is safe.
+  LR1121Hal::handleDeferredISR();
 
   // Automatically dump packets once we have collected enough
   if (pkt_capture_count == 15 && !do_packet_dump) {
@@ -623,21 +1054,53 @@ void elrs_loop(void) {
   static uint32_t lastDiag = 0;
   if (millis() - lastDiag > 2000) {
     lastDiag = millis();
-    DBGLN("ISR:%lu RXdone:%lu CRCfail:%lu conn:%d rate:%d freq:%lu",
-          isr_1_pending_count + isr_2_pending_count,
-          pkt_capture_count, // Using pkt_capture_count as proxy for rxDoneCount
-          crcFailCount, connectionState,
+
+    uint32_t isrCount = 0;
+    uint32_t rxIrqCount = 0;
+    uint32_t txIrqCount = 0;
+    uint32_t otherIrqCount = 0;
+    uint32_t lastIrq = 0;
+    lr1121_get_isr_stats(&isrCount, &rxIrqCount, &txIrqCount, &otherIrqCount,
+                         &lastIrq);
+    (void)txIrqCount;
+    (void)otherIrqCount;
+
+    DBGLN("ISR:%lu RXirq:%lu RXok:%lu CRCfail:%lu conn:%d rate:%d freq:%lu "
+          "DIO1:%d IRQ:0x%08lX",
+          isrCount, rxIrqCount, pkt_capture_count, crcFailCount, connectionState,
           ExpressLRS_currAirRate_Modparams
               ? ExpressLRS_currAirRate_Modparams->index
               : 0,
-          Radio.currFreq);
+          Radio.currFreq, lr1121_dio1_read(), lastIrq);
   }
 
   unsigned long now = millis();
 
+  updateTelemetryBurst();
+
+  if (uidSavePending) {
+    uidSavePending = false;
+    (void)elrs_config_set_uid(pendingUid);
+    (void)elrs_config_save();
+    OtaUpdateCrcInitFromUid();
+    DBGLN("Persisted UID from MSP bind");
+  }
+
+  if (dataUlReady) {
+    DataUlReceiveComplete();
+  }
+
+  updateSwitchMode();
+
   // Rate cycling when disconnected
   if (connectionState == disconnected) {
     cycleRfMode();
+  }
+
+  if ((connectionState == tentative) &&
+      ((now - LastSyncPacket) >
+       ExpressLRS_currAirRate_RFperfParams->RxLockTimeoutMs)) {
+    LostConnection(true);
   }
 
   // Connection timeout check
@@ -645,20 +1108,25 @@ void elrs_loop(void) {
     uint32_t disconnectTimeout =
         ExpressLRS_currAirRate_RFperfParams->DisconnectTimeoutMs;
     if ((now - LastValidPacket) > disconnectTimeout) {
-      setConnectionState(disconnected);
+      LostConnection(true);
     }
   }
 
   // Rate change handling
   if (ExpressLRS_nextAirRateIndex != ExpressLRS_currAirRate_Modparams->index) {
-    setConnectionState(disconnected);
-    SetRFLinkRate(ExpressLRS_nextAirRateIndex, false);
-    Radio.RXnb();
+    LostConnection(true);
+  }
+
+  if ((RXtimerState == tim_tentative) &&
+      ((now - GotConnectionMillis) > ConsiderConnGoodMillis) &&
+      (LPF_OffsetDx.value() <= 5) && (LPF_OffsetDx.value() >= -5)) {
+    RXtimerState = tim_locked;
   }
 
   // Send CRSF RC channels to flight controller when connected
   static uint32_t lastRcOutput = 0;
   if ((connectionState == connected) && connectionHasModelMatch &&
+      (TxOtaProtocol == TX_NORMAL_MODE) &&
       (now - lastRcOutput) >= CRSF_RC_OUTPUT_INTERVAL) {
     lastRcOutput = now;
 
@@ -682,7 +1150,8 @@ void elrs_loop(void) {
     }
 
     // Send link stats to FC via CRSF
-    if (crsf_serial_is_ready() && connectionState == connected) {
+    if (crsf_serial_is_ready() && (connectionState == connected) &&
+        (TxOtaProtocol == TX_NORMAL_MODE)) {
       crsf_link_stats_t crsfStats;
       crsfStats.uplink_rssi_1 = linkStats.uplink_RSSI_1;
       crsfStats.uplink_rssi_2 = linkStats.uplink_RSSI_2;
@@ -727,6 +1196,8 @@ void elrs_loop(void) {
 
   // Poll bind button for long-press detection
   bind_button_poll();
+
+  updateBindingMode(now);
 
   //=========================================================================
   // HP GPIO DIO1 Interrupt Mode
@@ -785,14 +1256,32 @@ void elrs_set_channel_callback(elrs_channel_callback_t callback) {
 }
 
 void elrs_enter_binding_mode(void) {
+  if (InBindingMode) {
+    return;
+  }
+
+  OtaCrcInitializer = OTA_VERSION_ID;
+  OtaNonce = 0;
   InBindingMode = true;
-  SetRFLinkRate(RATE_BINDING, true);
+  scanIndex = getStartupOrBindingRateIndex();
+  ExpressLRS_nextAirRateIndex = scanIndex;
+  SetRFLinkRate(scanIndex, true);
+  Radio.RXnb();
   DBGLN("Entering binding mode");
 }
 
 void elrs_exit_binding_mode(void) {
+  if (!InBindingMode) {
+    return;
+  }
+
   InBindingMode = false;
-  SetRFLinkRate(scanIndex, false);
+  OtaUpdateCrcInitFromUid();
+  FHSSrandomiseFHSSsequence(uidMacSeedGet());
+  LockRFmode = false;
+  scanIndex = getStartupOrBindingRateIndex();
+  ExpressLRS_nextAirRateIndex = scanIndex;
+  LostConnection(true);
   DBGLN("Exiting binding mode");
 }
 

@@ -5,11 +5,8 @@
 
 // C functions from lr1121_driver.c
 extern "C" {
-void lr1121_dio1_enable(void);
-bool lr1121_wait_busy_timeout(uint32_t timeout_ms);
-bool lr1121_send_command(uint16_t opcode, const uint8_t *params,
-                         uint16_t param_len);
-bool lr1121_read_response(uint8_t *response, uint16_t response_len);
+#include "lr1121_driver.h"
+#include "lr1121_elrs_init.h"
 }
 
 // LittleFS is ESP32-specific, not needed for SiW917
@@ -22,6 +19,38 @@ bool lr1121_read_response(uint8_t *response, uint16_t response_len);
 
 LR1121Hal hal;
 LR1121Driver *LR1121Driver::instance = NULL;
+
+static int UpdateFirmwareWithCDriver(
+    const SX12XX_Radio_Number_t radioNumber) {
+  if (radioNumber != SX12XX_Radio_1) {
+    DBGLN("LR1121 OTA helper only supports Radio_1 on SiW917");
+    return -1;
+  }
+
+  if (lr1121_begin_update(sizeof(lr11xx_firmware_image)) != 0) {
+    return -1;
+  }
+
+  WORD_ALIGNED_ATTR uint8_t dest[256];
+  for (uint32_t pos = 0; pos < sizeof(lr11xx_firmware_image) / 4; pos += 64) {
+    uint32_t size = 256;
+    if (pos + 63 > sizeof(lr11xx_firmware_image) / 4) {
+      size = sizeof(lr11xx_firmware_image) % 256;
+    }
+
+    memcpy(dest, lr11xx_firmware_image + pos, size);
+    for (size_t i = 0; i < size; i += 4) {
+      const auto ptr = reinterpret_cast<uint32_t *>(&dest[i]);
+      *ptr = __builtin_bswap32(*ptr);
+    }
+
+    if (lr1121_write_update_bytes(dest, size) != 0) {
+      return -1;
+    }
+  }
+
+  return lr1121_end_update();
+}
 
 // DEBUG_LR1121_OTA_TIMING
 
@@ -83,31 +112,26 @@ bool LR1121Driver::CheckVersion(const SX12XX_Radio_Number_t radioNumber) {
 #else
   bool skipUpdate = false;
 #endif
+  version = GetFirmwareVersion(radioNumber);
   if (!skipUpdate && (version.type != LR1121_FIRMWARE_TYPE ||
                       version.version != LR11XX_FIRMWARE_VERSION)) {
+    DBGLN("LR1121 #%d version mismatch: expected Type 0x%02X / FW 0x%04X, got "
+          "Type 0x%02X / FW 0x%04X",
+          radioNumber, LR1121_FIRMWARE_TYPE, LR11XX_FIRMWARE_VERSION,
+          version.type, version.version);
     DBGLN("Upgrading radio #%d", radioNumber);
-    // do upgrade
-    if (BeginUpdate(radioNumber, sizeof(lr11xx_firmware_image)) != 0)
+    if (UpdateFirmwareWithCDriver(radioNumber) != 0)
       return false;
-    uint8_t dest[256];
-    for (uint32_t pos = 0; pos < sizeof(lr11xx_firmware_image) / 4; pos += 64) {
-      uint32_t size = 256;
-      if (pos + 63 > sizeof(lr11xx_firmware_image) / 4)
-        size = sizeof(lr11xx_firmware_image) % 256;
-      memcpy(dest, lr11xx_firmware_image + pos, size);
 
-      for (size_t i = 0; i < size; i += 4) {
-        const auto ptr = (uint32_t *)&dest[i];
-        *ptr = __builtin_bswap32(*ptr);
-      }
-      WriteUpdateBytes(dest, size);
-    }
-
-    if (EndUpdate() != 0)
-      return false;
+    // Match the working Web UI flow: tear down and fully reinitialize the HAL
+    // before trusting the post-update version probe.
+    hal.end();
+    delay(10);
+    hal.init();
+    delay(50);
 
     version = GetFirmwareVersion(radioNumber);
-    if (version.type != LR1121_FIRMWARE_TYPE &&
+    if (version.type != LR1121_FIRMWARE_TYPE ||
         version.version != LR11XX_FIRMWARE_VERSION) {
       DBGLN("LR1121 #%d failed to be detected or upgraded. Type: 0x%02X, "
             "Version: 0x%04X",
@@ -170,14 +194,16 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
                      SX12XX_Radio_All); // Enable DCDC converter instead of LDO
   }
 
-  // 2.1.3.1 CalibImage
-  // NOTE: CalibrateImage is already done in lr1121_waveshare_init() during
-  // hal.init() for the 915MHz band. Re-calibrating here can cause errors if
-  // chip state changed. Skip this for SiW917 + Core1121 since TCXO init handles
-  // it. uint8_t CalImagebuf[2]; CalImagebuf[0] = ((minimumFrequency / 1000000 )
-  // - 1) / 4; CalImagebuf[1] = 1 + ((maximumFrequency / 1000000 ) + 1) / 4;
-  // hal.WriteCommand(LR11XX_SYSTEM_CALIBRATE_IMAGE_OC, CalImagebuf,
-  // sizeof(CalImagebuf), SX12XX_Radio_All);
+  // CalibrateImage must match the actual operating band. The generic
+  // Waveshare bring-up sequence performs a baseline calibration during init,
+  // but the active runtime band may differ (for example, forced 2.4 GHz
+  // bring-up on Core1121-HF). Re-apply the ELRS band-specific image
+  // calibration here using the real min/max frequencies before entering RX.
+  if (!lr1121_elrs_calib_image(minimumFrequency, maximumFrequency)) {
+    DBGLN("CalibImage failed for runtime band %lu-%lu",
+          (unsigned long)minimumFrequency, (unsigned long)maximumFrequency);
+    return false;
+  }
 
   return true;
 }
@@ -197,8 +223,10 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
                           uint8_t _PayloadLength, bool setFSKModulation,
                           uint8_t fskSyncWord1, uint8_t fskSyncWord2,
                           SX12XX_Radio_Number_t radioNumber) {
-  DBGLN("Config: freq=%u, bw=%d, sf=%d, cr=%d, FSK=%d", (unsigned int)regfreq,
-        (int)bw, (int)sf, (int)cr, (int)setFSKModulation);
+  DBGLN("Config: freq=%u, bw=%d, sf=%d, cr=%d, FSK=%d, Pre=%d, InvIQ=%d, "
+        "Payload=%d",
+        (unsigned int)regfreq, (int)bw, (int)sf, (int)cr, (int)setFSKModulation,
+        (int)PreambleLength, (int)InvertIQ, (int)_PayloadLength);
   PayloadLength = _PayloadLength;
 
   bool isSubGHz = regfreq < 1000000000;
@@ -221,6 +249,12 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
   // Using STDBY_RC on a TCXO module can cause calibration errors
   // because the RC oscillator is less stable than the TCXO
   SetMode(LR1121_MODE_STDBY_XOSC, radioNumber);
+
+  // CRITICAL: When reconfiguring the radio, the TCXO needs time to stabilize.
+  // The SiW917 SPI is so fast that if we immediately send `SetPacketType`
+  // (0x020E), the radio asserts BUSY and times out. Add a 5ms delay to prevent
+  // `WriteCommand BUSY timeout`.
+  delay(5);
 
   useFSK = setFSKModulation;
 
@@ -540,11 +574,6 @@ void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
     // 2.1.2.1 SetStandby
     buf[0] = 0x01;
     hal.WriteCommand(LR11XX_SYSTEM_SET_STANDBY_OC, buf, 1, radioNumber);
-    // CRITICAL: When switching to STDBY_XOSC, the TCXO needs time to stabilize.
-    // The SiW917 SPI is so fast that if we immediately send `SetPacketType`
-    // (0x020E), the radio asserts BUSY and times out. Add a 5ms delay to
-    // prevent `WriteCommand BUSY timeout`.
-    delay(5);
     break;
 
   case LR1121_MODE_FS:
@@ -552,14 +581,19 @@ void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
     hal.WriteCommand(LR11XX_SYSTEM_SET_FS_OC, radioNumber);
     break;
 
-  case LR1121_MODE_RX_CONT:
+  case LR1121_MODE_RX_CONT: {
     // 7.2.2 SetRx - Continuous RX mode (0xFFFFFF = no timeout)
-    // HOT PATH - No debug output here!
+    static bool firstRx = true;
+    if (firstRx) {
+      DBGLN("SetRx(0xFFFFFF) - Entering continuous RX mode");
+      firstRx = false;
+    }
     buf[0] = 0xFF;
     buf[1] = 0xFF;
     buf[2] = 0xFF; // Continuous RX
     hal.WriteCommand(LR11XX_RADIO_SET_RX_OC, buf, 3, radioNumber);
     break;
+  }
 
   case LR1121_MODE_TX:
     // Table 7-3: SetTx Command
@@ -617,6 +651,11 @@ void LR1121Driver::SetPacketParamsLoRa(
 void ICACHE_RAM_ATTR
 LR1121Driver::SetFrequencyReg(uint32_t freq, SX12XX_Radio_Number_t radioNumber,
                               bool doRx, uint32_t rxTime) {
+  // Citation: LR1121 User Manual Section 7.2.3 SetRfFrequency
+  // "The command SetRfFrequency must be issued in STDBY_RC or STDBY_XOSC modes"
+  // ELRS continuously calls this while in RX_CONT, which causes SPI failure.
+  SetMode(LR1121_MODE_STDBY_XOSC, radioNumber);
+
   uint8_t buf[7] = {
       (uint8_t)(freq >> 24),
       (uint8_t)(freq >> 16),
@@ -639,70 +678,62 @@ LR1121Driver::SetFrequencyReg(uint32_t freq, SX12XX_Radio_Number_t radioNumber,
 }
 
 // 4.1.1 SetDioIrqParams
-// Citation: LR1121 User Manual Section 4.1.1
-//
-// CRITICAL: LR1121 uses DIO9 for interrupts, NOT DIO1!
-// - DIO1 on LR1121 is hardwired internally to SPI NSS (chip select)
-// - DIO9 is the "generic IRQ line" per Seeed/Waveshare documentation
-//
 // SetDioIrqParams command (opcode 0x0113) takes 8 bytes:
-//   - Bytes 0-3: IRQ enable mask (which IRQs to enable) - big-endian 32-bit
-//   - Bytes 4-7: DIO9 mask (which IRQs route to DIO9 pin) - big-endian 32-bit
+//   - Bytes 0-3:  IRQ enable mask (which IRQs to enable) - big-endian 32-bit
+//   - Bytes 4-7:  Dio1Mask (which IRQs route to DIO1 pin) - big-endian 32-bit
 //
-// Physical wiring requirement:
-//   Connect LR1121 DIO9 to SiW917 GPIO_46 (HP domain)
-//
-// Setting 0xFFFFFFFF for both masks ensures ALL IRQs are enabled and routed
-// to DIO9 for hardware interrupt handling.
+// Physical wiring (Waveshare Core1121-HF):
+//   LR1121 DIO1 → SiW917 GPIO_46 (HP domain, rising-edge interrupt)
 void LR1121Driver::SetDioIrqParams() {
-  uint8_t buf[12] = {0};
+  uint8_t buf[8] = {0};
 
-  // IRQ mask: Enable ALL IRQs (0xFFFFFFFF)
-  buf[0] = 0xFF;
-  buf[1] = 0xFF;
-  buf[2] = 0xFF;
-  buf[3] = 0xFF;
+  const uint32_t irqMask = LR1121_IRQ_TX_DONE | LR1121_IRQ_RX_DONE;
 
-  // DIO1 mask: 0 (buf[4] to buf[7])
+  // Bytes 0-3: IRQ enable mask
+  buf[0] = (irqMask >> 24) & 0xFF;
+  buf[1] = (irqMask >> 16) & 0xFF;
+  buf[2] = (irqMask >> 8) & 0xFF;
+  buf[3] = irqMask & 0xFF;
 
-  // DIO2 mask: Route ALL IRQs to physical DIO9 pin (0xFFFFFFFF)
-  // The Seeed/Waveshare modules route the LR1121's DIO2 logical pin to the
-  // physical DIO9 pad.
-  buf[8] = 0xFF;
-  buf[9] = 0xFF;
-  buf[10] = 0xFF;
-  buf[11] = 0xFF;
+  // Bytes 4-7: Dio2Mask - ZERO to ensure no hardware routing conflict
+  buf[4] = 0;
+  buf[5] = 0;
+  buf[6] = 0;
+  buf[7] = 0;
 
   hal.WriteCommand(LR11XX_SYSTEM_SET_DIOIRQPARAMS_OC, buf, sizeof(buf),
                    SX12XX_Radio_All);
 
-  DBGLN("SetDioIrqParams: ALL IRQs enabled and routed to physical DIO9 (via "
-        "Dio2Mask)");
+  DBGLN("SetDioIrqParams: TX_DONE|RX_DONE routed to DIO1 (via Dio1Mask)");
 }
 
 uint32_t ICACHE_RAM_ATTR
 LR1121Driver::GetIrqStatus(SX12XX_Radio_Number_t radioNumber) {
   uint8_t status[6] = {0};
+
+  // Upstream ELRS hack: Send ClearIrq (0x0114) with mask 0xFFFFFFFF.
+  // The LR1121 has NO separate GetIrqStatus command. Instead, the ClearIrq
+  // command returns the current IRQ status in the response bytes while
+  // simultaneously clearing all IRQs. This is an atomic get+clear.
+  // Citation: upstream ELRS LR1121.cpp GetIrqStatus()
   status[0] = LR11XX_SYSTEM_CLEAR_IRQ_OC >> 8;
   status[1] = LR11XX_SYSTEM_CLEAR_IRQ_OC & 0xFF;
   status[2] = 0xFF;
   status[3] = 0xFF;
   status[4] = 0xFF;
   status[5] = 0xFF;
+
   hal.ReadCommand(status, sizeof(status), radioNumber);
-  // IRQ flags returned by radio are 32-bit Little-Endian (status[5] is highest
-  // byte) Reversing the assembly order ensures LR1121_IRQ_RX_DONE (0x00000008)
-  // matches the data.
-  return status[5] << 24 | status[4] << 16 | status[3] << 8 | status[2];
+
+  // IRQ flags are returned Big-Endian (MSB first at status[2])
+  return (uint32_t)status[2] << 24 | (uint32_t)status[3] << 16 |
+         (uint32_t)status[4] << 8 | (uint32_t)status[5];
 }
 
 void ICACHE_RAM_ATTR
 LR1121Driver::ClearIrqStatus(SX12XX_Radio_Number_t radioNumber) {
-  uint8_t buf[4];
-  buf[0] = 0xFF;
-  buf[1] = 0xFF;
-  buf[2] = 0xFF;
-  buf[3] = 0xFF;
+  // Clear IRQ status command (0x0114) takes 4 bytes of masks
+  uint8_t buf[4] = {0xFF, 0xFF, 0xFF, 0xFF};
   hal.WriteCommand(LR11XX_SYSTEM_CLEAR_IRQ_OC, buf, sizeof(buf), radioNumber);
 }
 
@@ -822,6 +853,9 @@ bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
 void ICACHE_RAM_ATTR LR1121Driver::RXnb() {
   // HOT PATH - No debug output or extra SPI commands here!
   // This is called from ISR context and must be fast.
+  // Citation: LR1121 User Manual Section 7.2.2 SetRx
+  // "The command SetRx can be issued only in STDBY_RC or STDBY_XOSC modes"
+  SetMode(LR1121_MODE_STDBY_XOSC, SX12XX_Radio_All);
   SetMode(LR1121_MODE_RX_CONT, SX12XX_Radio_All);
 }
 
@@ -893,13 +927,9 @@ void ICACHE_RAM_ATTR LR1121Driver::GetLastPacketStats() {
   }
 }
 
-void ICACHE_RAM_ATTR LR1121Driver::IsrCallback_1() {
-  IsrCallback(SX12XX_Radio_1);
-}
+void LR1121Driver::IsrCallback_1() { IsrCallback(SX12XX_Radio_1); }
 
-void ICACHE_RAM_ATTR LR1121Driver::IsrCallback_2() {
-  IsrCallback(SX12XX_Radio_2);
-}
+void LR1121Driver::IsrCallback_2() { IsrCallback(SX12XX_Radio_2); }
 
 // Debug counters for ISR tracking
 static volatile uint32_t isrCallCount = 0;
@@ -915,45 +945,15 @@ bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
                          uint16_t length);
 }
 
-void ICACHE_RAM_ATTR
-LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
-  // Read IRQ status using the PROVEN two-phase SPI protocol
-  // The LR1121 requires:
-  //   Phase 1: Send GetStatus command (0x0100), deassert CS, wait BUSY
-  //   Phase 2: Assert CS, read response (stat1, stat2, irq[3:0]), deassert CS
-  //
-  // The previous single-phase transfer was broken because the LR1121 needs
-  // time to process the command between CS deassertion and reassertion.
-  // This was proven by the standalone RX test which uses the same two-phase
-  // protocol via lr1121_send_command() + lr1121_read_response().
-
-  uint32_t irqStatus = 0;
-
-  // Phase 1: Send GetStatus command
-  if (!lr1121_wait_busy_timeout(10)) {
-    return; // BUSY timeout, skip this ISR
-  }
-  lr1121_send_command(0x0100, nullptr, 0); // GetStatus opcode
-
-  // Phase 2: Wait for processing, then read response
-  if (!lr1121_wait_busy_timeout(10)) {
-    return; // BUSY timeout after command
-  }
-
-  uint8_t resp[6] = {0};
-  lr1121_read_response(resp, 6);
-
-  // Parse IRQ status from response bytes 2-5 (big-endian)
-  // resp layout: [stat1, stat2, irq_MSB, irq_2, irq_1, irq_LSB]
-  irqStatus = ((uint32_t)resp[2] << 24) | ((uint32_t)resp[3] << 16) |
-              ((uint32_t)resp[4] << 8) | ((uint32_t)resp[5]);
+void LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
+  uint32_t irqStatus = instance->GetIrqStatus(radioNumber);
 
   // Delegate to the version that takes pre-read status
   IsrCallbackWithStatus(radioNumber, irqStatus);
 }
 
-void ICACHE_RAM_ATTR LR1121Driver::IsrCallbackWithStatus(
-    SX12XX_Radio_Number_t radioNumber, uint32_t irqStatus) {
+void LR1121Driver::IsrCallbackWithStatus(SX12XX_Radio_Number_t radioNumber,
+                                         uint32_t irqStatus) {
   isrCallCount++;
   instance->processingPacketRadio = radioNumber;
   const SX12XX_Radio_Number_t otherRadioNumber =
@@ -1012,6 +1012,14 @@ struct lr1121UpdateState_s {
 };
 
 static lr1121UpdateState_s *lr1121UpdateState;
+static constexpr uint32_t LR1121BootloaderWriteHeaderSize = 6;
+
+// The Semtech Bootloader strictly requires exactly 256-byte payload chunks for all
+// transfers except the last one.
+// We previously limited this to 240/250 due to a 256-byte GSPI DMA limit on SiW917.
+// Now that the SiW917 SPI driver DMA buffer has been increased to 512 bytes,
+// we can safely use the official 256-byte payload sizes.
+static constexpr uint32_t LR1121BootloaderMaxWritePayload = 256;
 
 firmware_version_t
 LR1121Driver::GetFirmwareVersion(const SX12XX_Radio_Number_t radioNumber,
@@ -1020,6 +1028,10 @@ LR1121Driver::GetFirmwareVersion(const SX12XX_Radio_Number_t radioNumber,
   hal.WriteCommand(command, radioNumber);
   hal.ReadCommand(buffer, sizeof(buffer), radioNumber);
   hal.WaitOnBusy(radioNumber);
+
+  DBGLN("GetFirmwareVersion raw: [%02X %02X %02X %02X %02X] -> HW=0x%02X Type=0x%02X FW=0x%04X",
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4],
+        buffer[1], buffer[2], (uint16_t)(buffer[3] << 8 | buffer[4]));
 
   return {.hardware = buffer[1],
           .type = buffer[2],
@@ -1087,25 +1099,35 @@ static void writeBytes(const uint8_t *data, const uint32_t data_size) {
   uint32_t write_size = lr1121UpdateState->left_over;
   if (data != nullptr) {
     DBGLN("Left %d, new %d", lr1121UpdateState->left_over, data_size);
-    memcpy(lr1121UpdateState->packet.buffer + lr1121UpdateState->left_over,
+    memcpy(lr1121UpdateState->packet.header + 6 + lr1121UpdateState->left_over,
            data, data_size);
     write_size += data_size;
   }
+  
+  if (write_size == 0) {
+    return; // Don't send empty firmware update packets
+  }
+
+  if (write_size > LR1121BootloaderMaxWritePayload) {
+    DBGLN("LR1121 update chunk too large: %u > %u", (unsigned)write_size,
+          (unsigned)LR1121BootloaderMaxWritePayload);
+    return;
+  }
   DBGLN("Flashing %d at %x", write_size, lr1121UpdateState->totalSize);
 
-  // Have to do this the OLD way, so we can pump out more than 64 bytes in one
-  // message
+  // The SiW917 GSPI helper currently supports up to 256 bytes per transfer,
+  // including the 6-byte bootloader header. Keep the payload capped so the
+  // bootloader write stays within that proven transport limit.
   digitalWrite(lr1121UpdateState->updatingRadio == SX12XX_Radio_1
                    ? GPIO_PIN_NSS
                    : GPIO_PIN_NSS_2,
-               LOW);
-#if defined(PLATFORM_ESP32)
+                LOW);
+  // Use transferBytes with nullptr rx to do a write-only transfer.
+  // This is critical: SPIEx.transfer() overwrites the source buffer in-place,
+  // which corrupts the firmware payload. transferBytes(tx, nullptr, n) uses
+  // a separate dummy rx buffer to preserve the firmware data.
   SPIEx.transferBytes(lr1121UpdateState->packet.header, nullptr,
                       6 + write_size);
-#else
-  // On non-ESP32 platforms, use standard transfer
-  SPIEx.transfer(lr1121UpdateState->packet.header, 6 + write_size);
-#endif
   digitalWrite(lr1121UpdateState->updatingRadio == SX12XX_Radio_1
                    ? GPIO_PIN_NSS
                    : GPIO_PIN_NSS_2,
@@ -1120,15 +1142,17 @@ static void writeBytes(const uint8_t *data, const uint32_t data_size) {
 }
 
 int LR1121Driver::WriteUpdateBytes(const uint8_t *bytes, uint32_t size) {
-  while (size >= 256 - lr1121UpdateState->left_over) {
-    const uint32_t chunk_size = size > 256 - lr1121UpdateState->left_over
-                                    ? 256 - lr1121UpdateState->left_over
+  while (size >= LR1121BootloaderMaxWritePayload - lr1121UpdateState->left_over) {
+    const uint32_t chunk_size =
+        size > LR1121BootloaderMaxWritePayload - lr1121UpdateState->left_over
+            ? LR1121BootloaderMaxWritePayload -
+                  lr1121UpdateState->left_over
                                     : size;
     writeBytes(bytes, chunk_size);
     size -= chunk_size;
     bytes += chunk_size;
   }
-  memcpy(lr1121UpdateState->packet.buffer + lr1121UpdateState->left_over, bytes,
+  memcpy(lr1121UpdateState->packet.header + 6 + lr1121UpdateState->left_over, bytes,
          size);
   lr1121UpdateState->left_over += size;
   DBGLN("Left-over %d", lr1121UpdateState->left_over);
@@ -1154,6 +1178,10 @@ int LR1121Driver::EndUpdate() {
     while (!hal.WaitOnBusy(lr1121UpdateState->updatingRadio)) {
       delay(1);
     }
+    
+    // The LR1121 requires hundreds of milliseconds to fully reboot from Bootloader to Application mode.
+    // Waiting 300ms is necessary to prevent querying the bootloader instead of the application.
+    delay(300);
 
     DBGLN("Check not in BL mode");
     const firmware_version_t version = GetFirmwareVersion(
@@ -1161,8 +1189,6 @@ int LR1121Driver::EndUpdate() {
     DBGLN("Hardware %x", version.hardware >> 24);
     DBGLN("Type %x", version.type);
     DBGLN("Firmware %x", version.version & 0xFFFF);
-    delete lr1121UpdateState;
-    lr1121UpdateState = nullptr;
     retCode = version.type == 0xDF ? -2 : 0; // still in bootloader mode?
   } else {
     DBGLN("Finished expected %d, total %d", lr1121UpdateState->expectedFilesize,

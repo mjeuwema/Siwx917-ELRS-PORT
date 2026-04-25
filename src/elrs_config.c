@@ -88,10 +88,10 @@ static const elrs_config_t DEFAULT_CONFIG = {
   .vbind            = 0,
   
   /* Radio defaults - dual band support for LR1121 */
-  .reg_domain_low   = ELRS_DOMAIN_FCC_915,
+  .reg_domain_low   = ELRS_DOMAIN_ISM_2400,
   .reg_domain_high  = ELRS_DOMAIN_ISM_2400,
   .tx_power         = 20,   /* 20 dBm default */
-  .rate_index       = 8,    /* 50Hz rate (RATE_LORA_900_50HZ) */
+  .rate_index       = 17,   /* 50Hz rate (RATE_LORA_2G4_50HZ) */
   
   /* WiFi defaults */
   .wifi_ssid        = "ELRS_TEST_AP",

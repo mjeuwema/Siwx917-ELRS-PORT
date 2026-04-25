@@ -28,6 +28,7 @@ extern "C" {
 }
 
 volatile uint32_t isr_1_pending_count = 0;
+volatile uint32_t isr_1_total_count = 0;
 volatile uint32_t isr_2_pending_count = 0;
 volatile uint32_t busy_timeout_count = 0;
 
@@ -112,15 +113,12 @@ void LR1121Hal::reset(bool bootloader) {
   DBGLN("LR1121Hal::reset(bootloader=%d)", bootloader);
   (void)bootloader; // Not used - no bootloader mode support
 
-  // Perform hardware reset via C driver
-  lr1121_status_t status = lr1121_reset();
+  // Perform hardware reset AND full TCXO init via C driver
+  // CRITICAL: A raw lr1121_reset() kills the TCXO. We MUST re-run the full
+  // waveshare TCXO init sequence every time the chip is hardware reset!
+  lr1121_status_t status = lr1121_waveshare_init();
   if (status != LR1121_OK) {
-    DBGLN("LR1121 reset failed: %d", (int)status);
-  }
-
-  // Wait for BUSY to go LOW after reset (can take up to 300ms)
-  if (!lr1121_wait_busy_timeout(500)) {
-    DBGLN("LR1121 post-reset BUSY timeout");
+    DBGLN("LR1121 reset/init failed: %d", (int)status);
   }
 }
 
@@ -129,8 +127,8 @@ void LR1121Hal::reset(bool bootloader) {
 // Uses proven lr1121_send_command() from C driver
 //-----------------------------------------------------------------------------
 
-void ICACHE_RAM_ATTR
-LR1121Hal::WriteCommand(uint16_t opcode, SX12XX_Radio_Number_t radioNumber) {
+void LR1121Hal::WriteCommand(uint16_t opcode,
+                             SX12XX_Radio_Number_t radioNumber) {
   // We only support single radio (Radio_1)
   (void)radioNumber;
 
@@ -150,9 +148,8 @@ LR1121Hal::WriteCommand(uint16_t opcode, SX12XX_Radio_Number_t radioNumber) {
 // Uses proven lr1121_send_command() from C driver
 //-----------------------------------------------------------------------------
 
-void ICACHE_RAM_ATTR
-LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
-                        SX12XX_Radio_Number_t radioNumber) {
+void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
+                             SX12XX_Radio_Number_t radioNumber) {
   // We only support single radio (Radio_1)
   (void)radioNumber;
 
@@ -176,44 +173,38 @@ LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
 //   2. Response overwrites the same buffer
 //-----------------------------------------------------------------------------
 
-void ICACHE_RAM_ATTR LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
-                                            SX12XX_Radio_Number_t radioNumber) {
-  // We only support single radio (Radio_1)
+void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
+                            SX12XX_Radio_Number_t radioNumber) {
   (void)radioNumber;
 
-  // Wait for BUSY before transfer
+  // Wait for BUSY before Phase 2 transfer
+  // Citation: UserManual_LR1121_v1_2.pdf Section 3.2.3 Read Command
   if (!lr1121_wait_busy_timeout(10)) {
     busy_timeout_count++;
     DBGLN("ReadCommand BUSY timeout");
     return;
   }
 
-  // Full-duplex transfer: send extended tx_buf, receive into rx_buf
-  uint8_t tx_buf[256];
-  uint8_t rx_buf[256];
-
-  // We transfer exactly size bytes
-  uint16_t transfer_size = size;
-
-  for (uint16_t i = 0; i < transfer_size; i++) {
-    tx_buf[i] = buffer[i];
-  }
-
-  // Assert CS, perform full-duplex transfer, deassert CS
+  // ELRS Full-Duplex Hack: Output the caller's buffer on MOSI while
+  // capturing the response on MISO. This perfectly mimics the ESP32
+  // SPIEx.transferBytes behavior, which upstream ELRS relies on to pack
+  // opcodes for instantaneous commands (like GetIrqStatus) into the buffer.
   lr1121_cs_assert();
-  lr1121_spi_transfer(tx_buf, rx_buf, transfer_size);
-  lr1121_cs_deassert();
 
-  for (uint8_t i = 0; i < size; i++) {
-    buffer[i] = rx_buf[i];
+  if (size > 0) {
+    // spi_transfer correctly handles tx_data and rx_data pointing to the
+    // exact same memory because it uses statically allocated internal DMA buffers.
+    lr1121_spi_transfer(buffer, buffer, size);
   }
+
+  lr1121_cs_deassert();
 }
 
 //-----------------------------------------------------------------------------
 // BUSY Pin - uses proven lr1121_wait_busy_timeout() from C driver
 //-----------------------------------------------------------------------------
 
-bool ICACHE_RAM_ATTR LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
+bool LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
   // We only support single radio (Radio_1)
   (void)radioNumber;
 
@@ -226,14 +217,45 @@ bool ICACHE_RAM_ATTR LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
 // These bridge to the C++ callbacks from the C driver's ISR
 //-----------------------------------------------------------------------------
 
-void ICACHE_RAM_ATTR LR1121Hal::dioISR_1() {
-  if (instance && instance->IsrCallback_1) {
-    isr_1_pending_count++;
+// DEFERRED ISR: The SiW917 GSPI DMA is NOT re-entrant.
+// If the ISR fires while the main loop is mid-SPI transfer, both try to
+// use the same DMA buffers/CS pin, causing a hard fault.
+//
+// ADDITIONAL HAZARD: The LR1121 holds DIO1 HIGH until IRQs are cleared via
+// SPI. If the edge detector re-fires or the interrupt is treated as level,
+// the ISR will loop infinitely, starving the main loop. Solution: disable
+// the interrupt in the ISR, re-enable after processing in the main loop.
+static volatile bool dio1_isr_pending = false;
+
+void LR1121Hal::dioISR_1() {
+  isr_1_total_count++;
+  dio1_isr_pending = true;
+
+  // CRITICAL: Disable DIO1 interrupt to prevent infinite re-fire.
+  // DIO1 stays HIGH until IRQ is cleared via SPI in handleDeferredISR().
+  // We re-enable after the IRQ is cleared and DIO1 goes LOW.
+  lr1121_dio1_pause_isr();
+}
+
+// Called from elrs_loop() to process deferred DIO1 interrupts safely
+void LR1121Hal::handleDeferredISR() {
+  if (dio1_isr_pending) {
+    dio1_isr_pending = false;
+
+    // Call the IsrCallback which does SPI (GetIrqStatus clears IRQ, DIO1→LOW)
+    if (instance && instance->IsrCallback_1) {
+      uint32_t irqStatus = LR1121Driver::instance->GetIrqStatus(SX12XX_Radio_1);
+      LR1121Driver::IsrCallbackWithStatus(SX12XX_Radio_1, irqStatus);
+    }
+
+    // Now DIO1 should be LOW (IRQ cleared). Re-enable the interrupt
+    // so the next rising edge fires.
+    lr1121_dio1_resume_isr();
   }
 }
 
-void ICACHE_RAM_ATTR LR1121Hal::dioISR_2() {
+void LR1121Hal::dioISR_2() {
   if (instance && instance->IsrCallback_2) {
-    isr_2_pending_count++;
+    instance->IsrCallback_2();
   }
 }

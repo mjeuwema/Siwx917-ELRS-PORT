@@ -2,24 +2,18 @@
  * @file crsf_serial.c
  * @brief CRSF Serial Output Implementation for SiW917
  *
- * Implements CRSF protocol output to flight controllers.
- * 
- * NOTE: This is a stub implementation that stores data but doesn't actually
- * send over USART. To enable real USART output:
- *   1. Add sl_si91x_usart component to your .slcp project
- *   2. Uncomment USART code below and remove stubs
+ * Implements CRSF protocol output to flight controllers using the generated
+ * CMSIS USART0 driver configuration already present in this project.
  *
  * Citation: TBS CRSF Protocol Specification
  * Citation: ExpressLRS src/lib/CrsfProtocol/crsf_protocol.h
  */
 
 #include "crsf_serial.h"
+#include "Driver_USART.h"
+#include "RTE_Device_917.h"
 #include "rsi_debug.h"
 #include <string.h>
-
-/* Uncomment when USART is configured in project */
-/* #include "sl_si91x_usart.h" */
-/* #define CRSF_USE_USART 1 */
 
 /*******************************************************************************
  * Module State
@@ -27,14 +21,15 @@
 
 static bool g_initialized = false;
 static uint32_t g_tx_count = 0;
-
-#ifdef CRSF_USE_USART
-static sl_usart_handle_t g_usart_handle = NULL;
-#endif
+static volatile bool g_tx_in_progress = false;
+static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE];
+static ARM_DRIVER_USART *g_usart = NULL;
 
 /* CRC lookup table (polynomial 0xD5) */
 static uint8_t crc8_table[256];
 static bool crc_table_initialized = false;
+
+extern ARM_DRIVER_USART Driver_USART0;
 
 /*******************************************************************************
  * Debug Output
@@ -77,13 +72,52 @@ static uint8_t crsf_crc8(const uint8_t *data, uint8_t len)
  * USART Callback (required by driver)
  ******************************************************************************/
 
-#ifdef CRSF_USE_USART
 static void usart_callback(uint32_t event)
 {
-    /* Handle TX complete, errors, etc. */
-    (void)event;
+    if (event & (ARM_USART_EVENT_SEND_COMPLETE | ARM_USART_EVENT_TX_COMPLETE)) {
+        g_tx_in_progress = false;
+    }
 }
-#endif
+
+static int wait_for_tx_idle(void)
+{
+    /* Worst-case CRSF frame time at 420kbaud is well under 1ms. */
+    for (uint32_t spins = 0; spins < 1000000UL; spins++) {
+        ARM_USART_STATUS status = g_usart->GetStatus();
+        if (!g_tx_in_progress && !status.tx_busy) {
+            return 0;
+        }
+    }
+
+    /* Recover if the callback was missed but hardware is idle. */
+    if (!g_usart->GetStatus().tx_busy) {
+        g_tx_in_progress = false;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
+{
+    if ((frame == NULL) || (frame_len == 0) || (frame_len > sizeof(g_tx_buffer))) {
+        return -1;
+    }
+
+    if (wait_for_tx_idle() != 0) {
+        return -2;
+    }
+
+    memcpy(g_tx_buffer, frame, frame_len);
+    g_tx_in_progress = true;
+
+    if (g_usart->Send(g_tx_buffer, frame_len) != ARM_DRIVER_OK) {
+        g_tx_in_progress = false;
+        return -3;
+    }
+
+    return 0;
+}
 
 /*******************************************************************************
  * Public Functions
@@ -104,49 +138,51 @@ int crsf_serial_init(uint32_t baud_rate)
         baud_rate = CRSF_SERIAL_BAUDRATE_DEFAULT;
     }
 
-#ifdef CRSF_USE_USART
-    sl_status_t status;
-    
-    /* USART configuration for CRSF */
-    sl_si91x_usart_control_config_t config = {
-        .baudrate = baud_rate,
-        .mode = SL_USART_MODE_ASYNCHRONOUS,
-        .parity = SL_USART_NO_PARITY,
-        .stopbits = SL_USART_STOP_BITS_1,
-        .hwflowcontrol = SL_USART_FLOW_CONTROL_NONE,
-        .databits = SL_USART_DATA_BITS_8,
-        .misc_control = SL_USART_MISC_CONTROL_NONE,
-        .usart_module = USART_0,
-        .config_enable = ENABLE,
-        .synch_mode = DISABLE,
-    };
-    
-    /* Initialize USART0 */
-    status = sl_si91x_usart_init(USART_0, &g_usart_handle);
-    if (status != SL_STATUS_OK) {
-        CRSF_DBG("USART init failed: 0x%lx\n", (unsigned long)status);
+    g_usart = &Driver_USART0;
+
+    CRSF_DBG("Init USART0 on CLK GPIO_%d, TX GPIO_%d, RX GPIO_%d\n",
+             RTE_USART0_CLK_PIN, RTE_USART0_TX_PIN, RTE_USART0_RX_PIN);
+
+    if (g_usart->Initialize(usart_callback) != ARM_DRIVER_OK) {
+        CRSF_DBG("USART init failed\n");
+        g_usart = NULL;
         return -1;
     }
-    
-    /* Register callback */
-    status = sl_si91x_usart_register_event_callback(usart_callback);
-    if (status != SL_STATUS_OK && status != SL_STATUS_BUSY) {
-        CRSF_DBG("USART callback failed: 0x%lx\n", (unsigned long)status);
-    }
-    
-    /* Set control configuration */
-    status = sl_si91x_usart_set_configuration(g_usart_handle, &config);
-    if (status != SL_STATUS_OK) {
-        CRSF_DBG("USART config failed: 0x%lx\n", (unsigned long)status);
+
+    if (g_usart->PowerControl(ARM_POWER_FULL) != ARM_DRIVER_OK) {
+        CRSF_DBG("USART power-up failed\n");
+        g_usart->Uninitialize();
+        g_usart = NULL;
         return -2;
     }
-    
-    CRSF_DBG("Initialized at %lu baud (USART)\n", (unsigned long)baud_rate);
-#else
-    /* Stub mode - no actual USART output */
-    CRSF_DBG("Initialized (STUB MODE - no USART output)\n");
-    (void)baud_rate;
-#endif
+
+    if (g_usart->Control(ARM_USART_MODE_ASYNCHRONOUS |
+                             ARM_USART_DATA_BITS_8 |
+                             ARM_USART_PARITY_NONE |
+                             ARM_USART_STOP_BITS_1 |
+                             ARM_USART_FLOW_CONTROL_NONE,
+                         baud_rate) != ARM_DRIVER_OK) {
+        CRSF_DBG("USART config failed\n");
+        g_usart->PowerControl(ARM_POWER_OFF);
+        g_usart->Uninitialize();
+        g_usart = NULL;
+        return -3;
+    }
+
+    /*
+     * This port only needs FC TX output for standalone RX bring-up.
+     * Leave RX disabled so USART0 does not claim an unnecessary input pin.
+     */
+    if (g_usart->Control(ARM_USART_CONTROL_TX, 1) != ARM_DRIVER_OK) {
+        CRSF_DBG("USART TX enable failed\n");
+        g_usart->PowerControl(ARM_POWER_OFF);
+        g_usart->Uninitialize();
+        g_usart = NULL;
+        return -4;
+    }
+
+    g_tx_in_progress = false;
+    CRSF_DBG("Initialized at %lu baud (USART0)\n", (unsigned long)baud_rate);
     
     g_initialized = true;
     g_tx_count = 0;
@@ -156,13 +192,16 @@ int crsf_serial_init(uint32_t baud_rate)
 void crsf_serial_deinit(void)
 {
     if (!g_initialized) return;
-    
-#ifdef CRSF_USE_USART
-    sl_si91x_usart_deinit(g_usart_handle);
-    g_usart_handle = NULL;
-#endif
+
+    if (g_usart != NULL) {
+        (void)g_usart->Control(ARM_USART_ABORT_SEND, 0);
+        (void)g_usart->PowerControl(ARM_POWER_OFF);
+        (void)g_usart->Uninitialize();
+        g_usart = NULL;
+    }
     
     g_initialized = false;
+    g_tx_in_progress = false;
     CRSF_DBG("Deinitialized\n");
 }
 
@@ -223,16 +262,9 @@ int crsf_serial_send_channels(const uint32_t *channels)
     /* CRC over type + payload (bytes 2-24) */
     frame[25] = crsf_crc8(&frame[2], 23);
     
-#ifdef CRSF_USE_USART
-    /* Transmit via USART */
-    sl_status_t status = sl_si91x_usart_send_data(g_usart_handle, frame, 26);
-    if (status != SL_STATUS_OK) {
+    if (transmit_frame(frame, sizeof(frame)) != 0) {
         return -2;
     }
-#else
-    /* Stub mode - data prepared but not sent */
-    (void)frame;
-#endif
     
     g_tx_count++;
     return 0;
@@ -274,16 +306,9 @@ int crsf_serial_send_link_stats(const crsf_link_stats_t *stats)
     /* CRC over type + payload */
     frame[13] = crsf_crc8(&frame[2], 11);
     
-#ifdef CRSF_USE_USART
-    /* Transmit via USART */
-    sl_status_t status = sl_si91x_usart_send_data(g_usart_handle, frame, 14);
-    if (status != SL_STATUS_OK) {
+    if (transmit_frame(frame, sizeof(frame)) != 0) {
         return -2;
     }
-#else
-    /* Stub mode - data prepared but not sent */
-    (void)frame;
-#endif
     
     g_tx_count++;
     return 0;
@@ -292,4 +317,18 @@ int crsf_serial_send_link_stats(const crsf_link_stats_t *stats)
 uint32_t crsf_serial_get_tx_count(void)
 {
     return g_tx_count;
+}
+
+int crsf_serial_send_frame(const uint8_t *frame, uint32_t frame_len)
+{
+    if (!g_initialized || frame == NULL) {
+        return -1;
+    }
+
+    if (transmit_frame(frame, frame_len) != 0) {
+        return -2;
+    }
+
+    g_tx_count++;
+    return 0;
 }

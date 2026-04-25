@@ -95,7 +95,7 @@
 //     <o> USART0_CLK <0=>P0_8  <1=>P0_25 <2=>P0_52 <3=>P0_64
 //     <i> CLK of USART0
 #ifndef USART0_CLK_LOC
-#define RTE_USART0_CLK_PORT_ID 1
+#define RTE_USART0_CLK_PORT_ID 2
 
 #if (RTE_USART0_CLK_PORT_ID == 0)
 #define RTE_USART0_CLK_PORT HP
@@ -145,7 +145,7 @@
 //     <i> TX for USART0
 #ifndef USART0_TX_LOC
 #ifdef SLI_SI91X_MCU_CONFIG_RADIO_BOARD_BASE_VER
-#define RTE_USART0_TX_PORT_ID 1
+#define RTE_USART0_TX_PORT_ID 2
 #else
 #define RTE_USART0_TX_PORT_ID 0
 #endif
@@ -208,7 +208,7 @@
 //     <i> RX for USART0
 #ifndef USART0_RX_LOC
 #ifdef SLI_SI91X_MCU_CONFIG_RADIO_BOARD_BASE_VER
-#define RTE_USART0_RX_PORT_ID 1
+#define RTE_USART0_RX_PORT_ID 2
 #else
 #define RTE_USART0_RX_PORT_ID 0
 #endif

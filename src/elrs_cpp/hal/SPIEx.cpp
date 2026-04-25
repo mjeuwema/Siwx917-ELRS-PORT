@@ -34,6 +34,28 @@ void SPIClass::transfer(void *buf, size_t count) {
   lr1121_spi_transfer(data, data, count);
 }
 
+void SPIClass::transferBytes(const uint8_t *tx, uint8_t *rx, size_t count) {
+  if (count == 0) return;
+  if (rx != nullptr) {
+    // Full duplex: separate tx and rx buffers
+    lr1121_spi_transfer(tx, rx, count);
+  } else {
+    // Write-only: use a temporary dummy buffer so tx data is NOT overwritten.
+    // This is critical for firmware updates — the ESP32's transferBytes(tx, nullptr, n)
+    // does a write-only DMA transfer that preserves the source buffer.
+    uint8_t dummy[262];  // 6 header + 256 payload max
+    if (count <= sizeof(dummy)) {
+      lr1121_spi_transfer(tx, dummy, count);
+    } else {
+      // Fallback for unexpectedly large transfers
+      for (size_t i = 0; i < count; i++) {
+        uint8_t d;
+        lr1121_spi_transfer(&tx[i], &d, 1);
+      }
+    }
+  }
+}
+
 //-----------------------------------------------------------------------------
 // SPIExClass Implementation
 //-----------------------------------------------------------------------------

@@ -57,6 +57,8 @@ set(ELRS_CPP_SOURCES
     "../src/elrs_cpp/hal/device.cpp"
     # StubbornSender (for telemetry TX)
     "${ELRS_CPP_LIB_DIR}/StubbornSender/stubborn_sender.cpp"
+    # StubbornReceiver (for telemetry RX / downlink data)
+    "${ELRS_CPP_LIB_DIR}/StubbornReceiver/stubborn_receiver.cpp"
 )
 
 #=============================================================================

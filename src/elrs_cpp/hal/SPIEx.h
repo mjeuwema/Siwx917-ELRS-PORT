@@ -27,6 +27,7 @@ public:
     
     uint8_t transfer(uint8_t data);
     void transfer(void *buf, size_t count);
+    void transferBytes(const uint8_t *tx, uint8_t *rx, size_t count);
 
 private:
     uint8_t _bitOrder = MSBFIRST;

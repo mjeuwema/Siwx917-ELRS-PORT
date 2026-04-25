@@ -45,6 +45,17 @@
 extern "C" {
 #endif
 
+/**
+ * Band selection for lr1121_waveshare_init() image calibration and for
+ * the lr1121_rx_test standalone test. Override via -DLR1121_BAND_24GHZ=1
+ * in CMake, or edit here.
+ *   0 = sub-GHz (915 MHz, CalibImage 0xE1..0xE9, PE4259 switch used)
+ *   1 = 2.4 GHz (CalibImage 0x94..0x98, internal RFIO_HF, no ext switch)
+ */
+#ifndef LR1121_BAND_24GHZ
+#define LR1121_BAND_24GHZ 1
+#endif
+
 /*******************************************************************************
  * ELRS-Compatible Command Opcodes
  * Citation: ExpressLRS LR1121.cpp + LR1121 Datasheet

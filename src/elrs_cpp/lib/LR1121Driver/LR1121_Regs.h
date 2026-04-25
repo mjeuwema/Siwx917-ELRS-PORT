@@ -148,6 +148,10 @@ enum {
   LR11XX_SYSTEM_SET_REGMODE_OC = 0x0110,
   LR11XX_SYSTEM_CALIBRATE_IMAGE_OC = 0x0111,
   LR11XX_SYSTEM_SET_DIO_AS_RF_SWITCH_OC = 0x0112,
+  // LR1121 Opcode: 0x0114 = ClearIrq (also returns IRQ status in response)
+  // There is NO separate GetIrqStatus command on the LR1121.
+  // Upstream ELRS uses ClearIrq with mask 0xFFFFFFFF as an atomic get+clear.
+  // Citation: Semtech SWDR001 lr11xx_system.c, upstream ELRS LR1121_Regs.h
   LR11XX_SYSTEM_SET_DIOIRQPARAMS_OC = 0x0113,
   LR11XX_SYSTEM_CLEAR_IRQ_OC = 0x0114,
   LR11XX_SYSTEM_CFG_LFCLK_OC = 0x0116,

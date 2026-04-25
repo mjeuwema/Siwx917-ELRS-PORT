@@ -58,10 +58,24 @@ uint32_t millis(void) {
 }
 
 uint32_t micros(void) {
-    // SysTick runs at SystemCoreClock
-    // Convert ticks to microseconds
-    uint32_t ticks = osKernelGetTickCount();
-    return ticks * 1000;  // Assuming 1ms tick
+    // Combine the RTOS tick counter with the live SysTick down-counter to
+    // preserve sub-millisecond timing. ELRS phase locking depends on this.
+    uint32_t tick_before;
+    uint32_t tick_after;
+    uint32_t systick_val;
+    const uint32_t systick_reload = SysTick->LOAD + 1U;
+
+    do {
+        tick_before = osKernelGetTickCount();
+        systick_val = SysTick->VAL;
+        tick_after = osKernelGetTickCount();
+    } while (tick_before != tick_after);
+
+    uint32_t elapsed_cycles = systick_reload - systick_val;
+    uint32_t sub_ms_us =
+        (uint32_t)(((uint64_t)elapsed_cycles * 1000ULL) / systick_reload);
+
+    return (tick_before * 1000U) + sub_ms_us;
 }
 
 void delay(uint32_t ms) {
@@ -69,10 +83,12 @@ void delay(uint32_t ms) {
 }
 
 void delayMicroseconds(uint32_t us) {
-    // Busy-wait for microsecond delays
-    // Assuming ~100MHz clock, each loop iteration ~10 cycles
-    volatile uint32_t count = (us * 10);
-    while (count--) {
+    if (us == 0) {
+        return;
+    }
+
+    uint32_t start = micros();
+    while ((micros() - start) < us) {
         __NOP();
     }
 }

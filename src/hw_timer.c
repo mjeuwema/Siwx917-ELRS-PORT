@@ -206,9 +206,13 @@ static void hw_timer_update_match(uint32_t interval_us) {
 
   uint32_t new_match = us_to_match_value(interval_us);
 
-  /* Update match value - CT API handles buffer if enabled */
-  sl_si91x_config_timer_set_match_count(SL_COUNTER_16BIT, SL_COUNTER_0,
-                                        new_match);
+  /* Update match value - Bypassing SDK API due to 16-bit truncation bug.
+   * We write to CT_MATCH_BUF_REG because buffering is enabled (BUF_REG0EN).
+   * This ensures the 32-bit match value is updated glitch-free when the
+   * counter wraps to 0. Writing directly to CT_MATCH_REG while the counter
+   * is running could cause it to miss the match and count for a full 32-bit
+   * cycle. */
+  CT->CT_MATCH_BUF_REG = new_match;
 }
 
 /* ========================================================================== */
@@ -451,22 +455,15 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   printf("hw_timer: [6/7] Clearing pending CT IRQ...\n");
   NVIC_ClearPendingIRQ(CT_IRQn);
 
-  /* Set CT interrupt to moderate priority (5) for ELRS timing accuracy
+  /* Set CT interrupt to priority 6 (below DMA at priority 5)
    *
-   * CRITICAL: Do NOT set this to 0 (highest)!
-   * The UDMA (DMA) completion interrupt must be able to fire during/after SPI
-   * transfers to clear the GSPI driver's internal busy flag. If the CT ISR is
-   * at priority 0, it preempts UDMA IRQ, preventing the DMA completion
-   * callback from firing, which causes SPI transfers to return
-   * ARM_DRIVER_ERROR_BUSY (SL_STATUS_BUSY 0x0004) on all subsequent calls.
-   *
-   * Priority 5 provides good timing (~±5µs jitter) while allowing DMA to
-   * complete. The hw_timer_pause_isr() guard in cs_assert() protects against
-   * CT firing DURING an SPI transfer, but priority must still allow UDMA IRQ
-   * to fire BETWEEN SPI transfers to clear the busy state.
+   * CRITICAL: ELRS rate hopping performs SPI transitions from inside this ISR.
+   * If CT_IRQn is at priority 5 (matching DMA), the DMA completion interrupt
+   * cannot preempt this ISR, leading to a deadlock. Priority 6 ensures
+   * the GSPI driver can always complete its transfer and clear the busy flag.
    */
-  NVIC_SetPriority(CT_IRQn, 5);
-  printf("hw_timer: [6/7] DONE (priority=5, below DMA)\n");
+  NVIC_SetPriority(CT_IRQn, 6);
+  printf("hw_timer: [6/7] DONE (priority=6, preemptible by DMA)\n");
 
   /* Unregister any existing callback first (in case of re-init) */
   printf("hw_timer: [7/7] Unregistering existing callback (if any)...\n");

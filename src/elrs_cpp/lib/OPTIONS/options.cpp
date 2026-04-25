@@ -50,7 +50,7 @@ uint32_t logo_image = 0;
 firmware_options_t firmwareOptions = {
     ._magic_ = {'E', 'L', 'R', 'S', 'O', 'P', 'T', 'S'},
     ._version_ = 1,
-    .domain = FCC915,  // 900MHz FCC band (index 1 = 40 channels, 903.5-926.9 MHz)
+    .domain = ISM2G4,  // Force 2.4GHz startup for SiW917/LR1121 bring-up
     .hasUID = 0,
     .uid = {0, 0, 0, 0, 0, 0},
     .flash_discriminator = 0,
@@ -69,6 +69,9 @@ firmware_options_t firmwareOptions = {
 
 bool options_init()
 {
+    // Keep runtime behavior on 2.4GHz for bring-up so we avoid the 900MHz path.
+    firmwareOptions.domain = ISM2G4;
+
     // Load UID from NVM3 persistent config
     // elrs_config_init() must be called before this function
     elrs_config_t* cfg = elrs_config_get();

@@ -5,9 +5,9 @@
  * Outputs CRSF RC channel data and link statistics to a flight controller
  * via USART. Compatible with Betaflight, INAV, Ardupilot, etc.
  *
- * Pin Configuration (BRD2708A):
- *   TX: GPIO_7 (USART0_TX) - Connect to FC RX
- *   RX: GPIO_6 (USART0_RX) - Optional, for bidirectional
+ * Pin Configuration:
+ *   Uses the generated `Driver_USART0` routing from `config/RTE_Device_917.h`.
+ *   Connect USART0 TX to the flight controller CRSF RX input.
  *
  * Citation: TBS CRSF Protocol Specification
  * Citation: ExpressLRS src/lib/CrsfProtocol/crsf_protocol.h
@@ -51,6 +51,7 @@ extern "C" {
 #define CRSF_SERIAL_CHANNEL_MIN        172     /* 988us */
 #define CRSF_SERIAL_CHANNEL_MID        992     /* 1500us */
 #define CRSF_SERIAL_CHANNEL_MAX        1811    /* 2012us */
+#define CRSF_SERIAL_MAX_FRAME_SIZE     26
 
 /*******************************************************************************
  * Data Structures
@@ -114,6 +115,15 @@ int crsf_serial_send_channels(const uint32_t *channels);
  * @return 0 on success, negative on error
  */
 int crsf_serial_send_link_stats(const crsf_link_stats_t *stats);
+
+/**
+ * @brief Send a prebuilt CRSF frame to the flight controller
+ *
+ * @param frame Complete CRSF frame including sync byte, length, type and CRC
+ * @param frame_len Total frame length in bytes
+ * @return 0 on success, negative on error
+ */
+int crsf_serial_send_frame(const uint8_t *frame, uint32_t frame_len);
 
 /**
  * @brief Get number of frames sent

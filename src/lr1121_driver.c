@@ -50,10 +50,11 @@
 #define SL_STATUS_EMPTY ((sl_status_t)0x0022)
 #endif
 
-/* USE_SOFT_SPI: Bit-bang SPI implementation
+/* USE_SOFT_SPI: Bit-bang SPI implementation (debug fallback only).
  *
- * Uncomment to use software bit-bang SPI (slower but proven to work).
- * Comment out to use hardware GSPI with DMA (faster, required for ELRS).
+ * Uncomment to use software bit-bang SPI. Otherwise the hardware GSPI
+ * peripheral is used in interrupt-driven FIFO mode (see
+ * SL_GSPI_DMA_CONFIG_ENABLE in sl_si91x_gspi_common_config.h).
  */
 // #define USE_SOFT_SPI
 
@@ -587,92 +588,56 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
   }
   return true;
 #else
-  /* Hardware GSPI Transfer using SDK API functions
+  /* Hardware GSPI transfer (interrupt-driven FIFO mode, no DMA).
    *
-   * This uses the SDK's sl_si91x_gspi_transfer_data() which should handle
-   * the full-duplex SPI transfer properly. We manage CS manually.
-   */
-  sl_status_t status;
-
-  /* CRITICAL: DMA requires static buffers with proper alignment!
-   * Stack buffers don't work with DMA because:
-   * 1. DMA operates asynchronously after function returns
-   * 2. Stack memory can be reused before DMA completes
-   * 3. Cache coherency issues on ARM Cortex-M4
+   * With SL_GSPI_DMA_CONFIG_ENABLE=0 the SDK's GSPI_Transfer() primes the
+   * first byte into GSPI_WRITE_FIFO, enables the GSPI IRQ, and drains the
+   * FIFOs byte-by-byte from GSPI_IRQHandler. Transfer-complete still fires
+   * ARM_SPI_EVENT_TRANSFER_COMPLETE via gspi_callback_event().
    *
-   * Using static buffers ensures memory persistence during DMA transfer.
-   * __attribute__((aligned(4))) ensures 32-bit alignment for DMA.
-   * volatile prevents compiler from optimizing away reads after DMA.
+   * The SDK requires both data_out and data_in to be non-NULL; give it
+   * small scratch buffers when the caller only cares about one direction.
    */
-  static volatile uint8_t __attribute__((aligned(4))) temp_tx[256];
-  static volatile uint8_t __attribute__((aligned(4))) temp_rx[256];
+  uint8_t tx_scratch[256];
+  uint8_t rx_scratch[256];
+  const uint8_t *tx_ptr;
+  uint8_t *rx_ptr;
 
-  if (length > sizeof(temp_tx)) {
+  if (length > sizeof(tx_scratch)) {
     DEBUGOUT("LR1121: SPI transfer too long (%d > %d)\n", length,
-             (int)sizeof(temp_tx));
+             (int)sizeof(tx_scratch));
     return false;
   }
 
-  /* Clear RX buffer with marker pattern to detect if DMA updates it */
-  memset((void *)temp_rx, 0xAA, length);
-
-  /* Prepare TX buffer */
   if (tx_data != NULL) {
-    memcpy((void *)temp_tx, tx_data, length);
+    tx_ptr = tx_data;
   } else {
-    memset((void *)temp_tx, 0x00, length);
+    memset(tx_scratch, 0x00, length);
+    tx_ptr = tx_scratch;
   }
+  rx_ptr = (rx_data != NULL) ? rx_data : rx_scratch;
 
-  /* Memory barrier to ensure CPU writes to TX buffer are complete before DMA
-   * starts
-   * __DSB() - Data Synchronization Barrier: ensures all memory accesses
-   * complete
-   * __ISB() - Instruction Synchronization Barrier: flushes pipeline
-   */
-  __DSB();
-  __ISB();
-
-  /* Set slave number before each transfer (matching working example) */
   sl_si91x_gspi_set_slave_number(GSPI_SLAVE_0);
-
-  /* Reset transfer complete flag */
   gspi_transfer_complete = false;
 
-  /* Perform the DMA transfer */
-  status = sl_si91x_gspi_transfer_data(gspi_handle, (uint8_t *)temp_tx,
-                                       (uint8_t *)temp_rx, length);
+  sl_status_t status = sl_si91x_gspi_transfer_data(
+      gspi_handle, (uint8_t *)tx_ptr, rx_ptr, length);
 
   if (status != SL_STATUS_OK && status != SL_STATUS_EMPTY) {
     DEBUGOUT("LR1121: SPI xfer fail: 0x%04lX\n", (unsigned long)status);
-    /* Clear stuck busy flag via ARM_SPI_ABORT_TRANSFER */
     ARM_DRIVER_SPI *drv = (ARM_DRIVER_SPI *)gspi_handle;
     drv->Control(ARM_SPI_ABORT_TRANSFER, 0);
     return false;
   }
 
-  /* Wait for transfer to complete (callback sets flag)
-   * CRITICAL: Always wait, even if status is SL_STATUS_EMPTY
-   */
   uint32_t timeout = 100000;
   while (!gspi_transfer_complete && timeout > 0) {
     timeout--;
   }
-
   if (timeout == 0) {
     DEBUGOUT("LR1121: SPI transfer timeout (status was 0x%04lX)\n",
              (unsigned long)status);
     return false;
-  }
-
-  /* Memory barrier to ensure DMA writes are visible to CPU
-   * This is critical for ARM Cortex-M4 with DMA
-   */
-  __DSB();
-  __ISB();
-
-  /* Copy received data to output buffer if provided */
-  if (rx_data != NULL) {
-    memcpy(rx_data, (void *)temp_rx, length);
   }
 
   return true;
@@ -2564,6 +2529,28 @@ void lr1121_dio1_disable(void) {
   dio1_callback_enabled = false;
 
   DEBUGOUT("LR1121: DIO1 interrupt disabled\n");
+}
+
+/**
+ * @brief Pause DIO1 NVIC interrupt (for SPI re-entrancy)
+ */
+void lr1121_dio1_pause_isr(void) {
+  if (!dio1_initialized) {
+    return;
+  }
+  uint32_t irqn = EGPIO_PIN_0_IRQn + DIO1_INT_CHANNEL;
+  NVIC_DisableIRQ((IRQn_Type)irqn);
+}
+
+/**
+ * @brief Resume DIO1 NVIC interrupt (for SPI re-entrancy)
+ */
+void lr1121_dio1_resume_isr(void) {
+  if (!dio1_initialized) {
+    return;
+  }
+  uint32_t irqn = EGPIO_PIN_0_IRQn + DIO1_INT_CHANNEL;
+  NVIC_EnableIRQ((IRQn_Type)irqn);
 }
 
 /**

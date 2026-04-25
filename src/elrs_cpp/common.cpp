@@ -160,6 +160,15 @@ bool isSupportedRFRate(uint8_t index)
             return false;
         }
     }
+    else
+    {
+        // In 2.4GHz mode, skip the 900MHz-only rates so scanning stays on-band.
+        if (ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_900 ||
+            ModParams->radio_type == RADIO_TYPE_LR1121_LORA_900)
+        {
+            return false;
+        }
+    }
 
     return true;
 }

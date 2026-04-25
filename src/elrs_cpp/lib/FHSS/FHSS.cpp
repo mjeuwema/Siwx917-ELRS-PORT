@@ -80,7 +80,21 @@ uint16_t secondaryBandCount;
 
 void FHSSrandomiseFHSSsequence(const uint32_t seed)
 {
+    // LR1121 2.4GHz operation uses the dual-band table even on single-radio
+    // targets. The sub-GHz `domains[]` table only has entries 0..7, so a
+    // forced 2.4GHz domain value (8/9) must not index into it.
+#if defined(RADIO_LR1121)
+    if (firmwareOptions.domain >= 8)
+    {
+        FHSSconfig = &domainsDualBand[0];
+    }
+    else
+    {
+        FHSSconfig = &domains[firmwareOptions.domain];
+    }
+#else
     FHSSconfig = &domains[firmwareOptions.domain];
+#endif
     sync_channel = FHSSconfig->freq_count / 2;
     freq_spread = (FHSSconfig->freq_stop - FHSSconfig->freq_start) * FREQ_SPREAD_SCALE / (FHSSconfig->freq_count - 1);
     primaryBandCount = (FHSS_SEQUENCE_LEN / FHSSconfig->freq_count) * FHSSconfig->freq_count;

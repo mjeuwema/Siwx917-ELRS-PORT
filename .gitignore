@@ -74,3 +74,20 @@ sl_si91x_gpio_uulp_example_2/
 
 # Upstream ELRS reference clone (use upstream_elrs/ for selected reference files)
 ExpressLRS/
+
+# Claude session data
+.claude/
+
+# Local helper/codex folders
+_archive/
+_codex_skills/
+helper_repo/
+
+# Loose build outputs in cmake_gcc root
+cmake_gcc/*.out
+cmake_gcc/*.s37
+cmake_gcc/*.hex
+cmake_gcc/*.bin
+cmake_gcc/build_err.txt
+cmake_gcc/build_log.txt
+cmake_gcc/build_output.txt
