@@ -34,6 +34,11 @@ public:
     static void resume();
 
     /**
+     * @brief Compatibility hook for platforms that need timer service polling.
+     */
+    static void service();
+
+    /**
      * @brief Update the timer interval
      * @param newTimerInterval New interval in microseconds
      */

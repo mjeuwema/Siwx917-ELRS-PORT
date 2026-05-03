@@ -43,8 +43,8 @@
 #include "sl_gpio_board.h"
 #include "sl_si91x_driver_gpio.h"
 
-/* SL_STATUS_EMPTY may not be defined in older SDK versions
- * It's used by GSPI when DMA completes but FIFO appears empty
+/* SL_STATUS_EMPTY may not be defined in older SDK versions.
+ * The GSPI SDK can return it for short FIFO-mode transfers.
  */
 #ifndef SL_STATUS_EMPTY
 #define SL_STATUS_EMPTY ((sl_status_t)0x0022)
@@ -53,10 +53,12 @@
 /* USE_SOFT_SPI: Bit-bang SPI implementation (debug fallback only).
  *
  * Uncomment to use software bit-bang SPI. Otherwise the hardware GSPI
- * peripheral is used in interrupt-driven FIFO mode (see
+ * peripheral is used in interrupt-driven FIFO mode with DMA disabled (see
  * SL_GSPI_DMA_CONFIG_ENABLE in sl_si91x_gspi_common_config.h).
  */
 // #define USE_SOFT_SPI
+
+#define LR1121_GSPI_BITRATE_HZ 8000000U
 
 #include <stdbool.h>
 #include <string.h>
@@ -239,13 +241,24 @@
 #define GSPI_STATUS_REG (*(volatile uint32_t *)(GSPI_BASE + 0x020))
 #define GSPI_WRITE_FIFO (*(volatile uint32_t *)(GSPI_BASE + 0x080))
 #define GSPI_READ_FIFO (*(volatile uint32_t *)(GSPI_BASE + 0x080))
+#define GSPI_INTR_MASK_REG (*(volatile uint32_t *)(GSPI_BASE + 0x024))
+#define GSPI_INTR_UNMASK_REG (*(volatile uint32_t *)(GSPI_BASE + 0x028))
+#define GSPI_INTR_ACK_REG (*(volatile uint32_t *)(GSPI_BASE + 0x030))
 
 /* GSPI Register bit definitions */
+#define GSPI_CONFIG1_MANUAL_WR (1UL << 1)
+#define GSPI_CONFIG1_MANUAL_RD (1UL << 2)
 #define GSPI_CONFIG1_FULL_DUPLEX_EN (1UL << 15)
+#define GSPI_WRITE_DATA2_USE_PREV_LENGTH (1UL << 7)
 #define GSPI_BUS_MODE_GPIO_MODE_EN (0x3FUL << 5)
 #define GSPI_CLK_CONFIG_CLK_EN (1UL << 1)
 #define GSPI_CONFIG2_RD_DATA_SWAP_ALL ((1UL << 4) | (1UL << 5) | (1UL << 6))
+#define GSPI_FIFO_THRLD_WFIFO_RESET (1UL << 8)
+#define GSPI_FIFO_THRLD_RFIFO_RESET (1UL << 9)
+#define GSPI_INTR_ACK_BIT (1UL << 0)
 #define GSPI_STATUS_BUSY (1UL << 0)
+#define GSPI_STATUS_WFIFO_FULL (1UL << 1)
+#define GSPI_STATUS_RFIFO_EMPTY (1UL << 7)
 
 /*******************************************************************************
  * Static Variables
@@ -506,11 +519,126 @@ static void cs_deassert(void) {
 /**
  * @brief Wait for GSPI to become idle
  */
-__attribute__((unused)) static void wait_gspi_idle(void) {
-  uint32_t timeout = 100000;
+static bool wait_gspi_idle_timeout(uint32_t timeout) {
   while ((GSPI_STATUS_REG & GSPI_STATUS_BUSY) && timeout > 0) {
     timeout--;
   }
+  return timeout > 0;
+}
+
+static void gspi_reset_fifos(void) {
+  const uint32_t fifo_thrld = GSPI_FIFO_THRLD_REG;
+  GSPI_FIFO_THRLD_REG =
+      fifo_thrld | GSPI_FIFO_THRLD_WFIFO_RESET | GSPI_FIFO_THRLD_RFIFO_RESET;
+  for (volatile int i = 0; i < 32; i++) {
+  }
+  GSPI_FIFO_THRLD_REG = fifo_thrld;
+}
+
+static bool wait_gspi_status_clear(uint32_t mask, uint32_t timeout) {
+  while ((GSPI_STATUS_REG & mask) && timeout > 0) {
+    timeout--;
+  }
+  return timeout > 0;
+}
+
+/**
+ * @brief Transfer bytes through GSPI without the Silicon Labs interrupt driver.
+ *
+ * This is intentionally separate from spi_transfer(): normal LR1121 setup keeps
+ * using the SDK path that is already proven on this board. The ELRS custom
+ * GET_PACKET opcode is latency-sensitive and previously wedged inside the SDK
+ * interrupt transaction, so this helper masks the GSPI IRQ and drains the FIFO
+ * synchronously.
+ */
+static bool spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
+                                uint16_t length) {
+#ifdef USE_SOFT_SPI
+  return spi_transfer(tx_data, rx_data, length);
+#else
+  if (length == 0) {
+    return true;
+  }
+
+  const uint32_t saved_config1 = GSPI_CONFIG1_REG;
+  const uint32_t saved_write_data2 = GSPI_WRITE_DATA2_REG;
+  const uint32_t saved_fifo_thrld = GSPI_FIFO_THRLD_REG;
+  const uint32_t gspi_irq_was_enabled = NVIC_GetEnableIRQ(GSPI0_IRQn);
+
+  if (!wait_gspi_idle_timeout(100000U)) {
+    DEBUGOUT("LR1121: polled GSPI busy before transfer\n");
+    return false;
+  }
+
+  NVIC_DisableIRQ(GSPI0_IRQn);
+  GSPI_INTR_MASK_REG |= GSPI_INTR_MASK_BIT;
+  GSPI_INTR_ACK_REG = GSPI_INTR_ACK_BIT;
+  gspi_reset_fifos();
+
+  GSPI_WRITE_DATA2_REG =
+      (saved_write_data2 & ~0x0FUL) | 8U | GSPI_WRITE_DATA2_USE_PREV_LENGTH;
+  GSPI_CONFIG1_REG =
+      (saved_config1 | GSPI_CONFIG1_MANUAL_WR | GSPI_CONFIG1_FULL_DUPLEX_EN) &
+      ~GSPI_CONFIG1_MANUAL_RD;
+  GSPI_INTR_UNMASK_REG |= GSPI_INTR_UNMASK_BIT;
+
+  bool ok = true;
+  for (uint16_t i = 0; i < length; i++) {
+    if (!wait_gspi_status_clear(GSPI_STATUS_WFIFO_FULL, 100000U)) {
+      DEBUGOUT("LR1121: polled GSPI WFIFO full at byte %u\n", i);
+      ok = false;
+      break;
+    }
+
+    GSPI_WRITE_FIFO = (uint32_t)((tx_data != NULL) ? tx_data[i] : 0x00U);
+
+    if (!wait_gspi_status_clear(GSPI_STATUS_RFIFO_EMPTY, 100000U)) {
+      static uint32_t polled_rfifo_empty_fail_count = 0;
+      if (polled_rfifo_empty_fail_count < 16) {
+        polled_rfifo_empty_fail_count++;
+        DEBUGOUT("LR1121: polled GSPI RFIFO empty at byte %u stat=0x%08lX "
+                 "cfg1=0x%08lX wd2=0x%08lX\n",
+                 i, (unsigned long)GSPI_STATUS_REG,
+                 (unsigned long)GSPI_CONFIG1_REG,
+                 (unsigned long)GSPI_WRITE_DATA2_REG);
+      }
+      ok = false;
+      break;
+    }
+
+    const uint8_t rx = (uint8_t)GSPI_READ_FIFO;
+    if (rx_data != NULL) {
+      rx_data[i] = rx;
+    }
+
+    if (!wait_gspi_status_clear(GSPI_STATUS_BUSY, 100000U)) {
+      DEBUGOUT("LR1121: polled GSPI busy timeout at byte %u\n", i);
+      ok = false;
+      break;
+    }
+  }
+
+  if (!wait_gspi_idle_timeout(100000U)) {
+    DEBUGOUT("LR1121: polled GSPI busy after transfer\n");
+    ok = false;
+  }
+
+  GSPI_CONFIG1_REG = saved_config1;
+  GSPI_WRITE_DATA2_REG = saved_write_data2;
+  GSPI_FIFO_THRLD_REG = saved_fifo_thrld;
+  GSPI_INTR_ACK_REG = GSPI_INTR_ACK_BIT;
+  GSPI_INTR_MASK_REG |= GSPI_INTR_MASK_BIT;
+  if (gspi_irq_was_enabled) {
+    NVIC_ClearPendingIRQ(GSPI0_IRQn);
+    NVIC_EnableIRQ(GSPI0_IRQn);
+  }
+
+  if (!ok) {
+    gspi_reset_fifos();
+  }
+
+  return ok;
+#endif
 }
 
 /**
@@ -596,10 +724,11 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
    * ARM_SPI_EVENT_TRANSFER_COMPLETE via gspi_callback_event().
    *
    * The SDK requires both data_out and data_in to be non-NULL; give it
-   * small scratch buffers when the caller only cares about one direction.
+   * shared scratch buffers when the caller only cares about one direction.
    */
-  uint8_t tx_scratch[256];
-  uint8_t rx_scratch[256];
+  enum { LR1121_SPI_TRANSFER_MAX = 512 };
+  static uint8_t tx_scratch[LR1121_SPI_TRANSFER_MAX];
+  static uint8_t rx_scratch[LR1121_SPI_TRANSFER_MAX];
   const uint8_t *tx_ptr;
   uint8_t *rx_ptr;
 
@@ -616,6 +745,13 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
     tx_ptr = tx_scratch;
   }
   rx_ptr = (rx_data != NULL) ? rx_data : rx_scratch;
+
+  if (!wait_gspi_idle_timeout(100000)) {
+    DEBUGOUT("LR1121: GSPI busy before transfer\n");
+    ARM_DRIVER_SPI *drv = (ARM_DRIVER_SPI *)gspi_handle;
+    drv->Control(ARM_SPI_ABORT_TRANSFER, 0);
+    return false;
+  }
 
   sl_si91x_gspi_set_slave_number(GSPI_SLAVE_0);
   gspi_transfer_complete = false;
@@ -637,6 +773,8 @@ static bool spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
   if (timeout == 0) {
     DEBUGOUT("LR1121: SPI transfer timeout (status was 0x%04lX)\n",
              (unsigned long)status);
+    ARM_DRIVER_SPI *drv = (ARM_DRIVER_SPI *)gspi_handle;
+    drv->Control(ARM_SPI_ABORT_TRANSFER, 0);
     return false;
   }
 
@@ -948,7 +1086,7 @@ lr1121_status_t lr1121_init(void) {
       .bit_width = 8,
       .clock_mode = SL_GSPI_MODE_0,
       .slave_select_mode = SL_GSPI_MASTER_HW_OUTPUT,
-      .bitrate = 8000000, /* 8 MHz - Production speed */
+      .bitrate = LR1121_GSPI_BITRATE_HZ,
       .swap_read =
           0, /* FIXED: Disable read swap - was corrupting packet data */
       .swap_write = 0,
@@ -959,7 +1097,9 @@ lr1121_status_t lr1121_init(void) {
     DEBUGOUT("LR1121: GSPI config failed: 0x%04lX\n", status);
     return LR1121_ERROR_SPI_INIT;
   }
-  DEBUGOUT("LR1121: GSPI configured: 2 MHz (SLOW DEBUG), Mode 0, 8-bit\n");
+  DEBUGOUT("LR1121: GSPI configured: %lu Hz, Mode 0, 8-bit, div=%lu\n",
+           (unsigned long)gspi_config.bitrate,
+           (unsigned long)sl_si91x_gspi_get_clock_division_factor(gspi_handle));
 
   /* Step 3: Register callback */
   status =
@@ -1886,8 +2026,9 @@ bool lr1121_wait_busy_timeout(uint32_t timeout_ms) {
  */
 bool lr1121_send_command_pub(uint16_t opcode, const uint8_t *params,
                              uint16_t param_len) {
-  uint8_t tx_buf[258]; /* Max opcode (2) + params (256) */
-  uint8_t rx_buf[258];
+  enum { LR1121_COMMAND_BUFFER_MAX = 512 };
+  static uint8_t tx_buf[LR1121_COMMAND_BUFFER_MAX];
+  static uint8_t rx_buf[LR1121_COMMAND_BUFFER_MAX];
   uint16_t total_len = 2 + param_len;
 
   if (total_len > sizeof(tx_buf)) {
@@ -1918,7 +2059,8 @@ bool lr1121_send_command(uint16_t opcode, const uint8_t *params,
  * @brief Wrapper to make lr1121_read_response public
  */
 bool lr1121_read_response(uint8_t *response, uint16_t response_len) {
-  uint8_t tx_buf[258];
+  enum { LR1121_RESPONSE_BUFFER_MAX = 512 };
+  static uint8_t tx_buf[LR1121_RESPONSE_BUFFER_MAX];
 
   if (response_len > sizeof(tx_buf)) {
     return false;
@@ -1938,6 +2080,239 @@ bool lr1121_read_response(uint8_t *response, uint16_t response_len) {
    */
 
   return result;
+}
+
+static bool soft_spi_transfer_with_cs(const uint8_t *tx_data, uint8_t *rx_data,
+                                      uint16_t length) {
+  if (length == 0) {
+    return true;
+  }
+
+  /*
+   * Soft SPI is used on the hot ELRS paths (GET_PACKET and SetFreq+Rx). It
+   * must get the same timer exclusion as the hardware-GSPI CS helpers, or a
+   * CT TICK/TOCK can preempt a bit-banged packet read and retune the LR1121 in
+   * the middle of the transaction.
+   */
+  hw_timer_pause_isr();
+
+  const uint32_t cfg_sck = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK);
+  const uint32_t cfg_miso = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO);
+  const uint32_t cfg_mosi = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI);
+  const uint32_t cfg_nss = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS);
+
+  // Temporarily take the SPI pins out of peripheral mode for a pure GPIO
+  // transaction. Restore the SDK/GSPI pin config before returning.
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK) &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO) &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI) &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS) &= ~(0xF << 2);
+
+  HP_GPIO_SET_OUTPUT(LR1121_PIN_SCK);
+  HP_GPIO_SET_OUTPUT(LR1121_PIN_MOSI);
+  HP_GPIO_SET_OUTPUT(LR1121_PIN_NSS);
+  HP_GPIO_SET_INPUT(LR1121_PIN_MISO);
+
+  HP_GPIO_SET_LOW(LR1121_PIN_SCK);
+  HP_GPIO_SET_LOW(LR1121_PIN_MOSI);
+
+  HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+  for (volatile int d = 0; d < 100; d++) {
+  }
+
+  for (uint16_t i = 0; i < length; i++) {
+    const uint8_t tx_byte = (tx_data != NULL) ? tx_data[i] : 0x00U;
+    uint8_t rx_byte = 0;
+
+    for (int bit = 7; bit >= 0; bit--) {
+      if ((tx_byte >> bit) & 0x01U) {
+        HP_GPIO_SET_HIGH(LR1121_PIN_MOSI);
+      } else {
+        HP_GPIO_SET_LOW(LR1121_PIN_MOSI);
+      }
+      for (volatile int d = 0; d < 12; d++) {
+      }
+
+      HP_GPIO_SET_HIGH(LR1121_PIN_SCK);
+      for (volatile int d = 0; d < 12; d++) {
+      }
+      if (HP_GPIO_READ(LR1121_PIN_MISO)) {
+        rx_byte |= (uint8_t)(1U << bit);
+      }
+
+      for (volatile int d = 0; d < 12; d++) {
+      }
+      HP_GPIO_SET_LOW(LR1121_PIN_SCK);
+      for (volatile int d = 0; d < 12; d++) {
+      }
+    }
+
+    if (rx_data != NULL) {
+      rx_data[i] = rx_byte;
+    }
+  }
+
+  for (volatile int d = 0; d < 100; d++) {
+  }
+  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  for (volatile int d = 0; d < 100; d++) {
+  }
+
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK) = cfg_sck;
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO) = cfg_miso;
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI) = cfg_mosi;
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS) = cfg_nss;
+
+  hw_timer_resume_isr();
+
+  return true;
+}
+
+bool lr1121_read_response_soft(uint8_t *response, uint16_t response_len) {
+  if (response == NULL) {
+    return false;
+  }
+
+  enum { LR1121_SOFT_RESPONSE_MAX = 64 };
+  static uint8_t soft_response[LR1121_SOFT_RESPONSE_MAX];
+
+  if (response_len > sizeof(soft_response)) {
+    return false;
+  }
+
+  memset(soft_response, 0xBB, response_len);
+  const bool ok = soft_spi_transfer_with_cs(NULL, soft_response, response_len);
+  if (!ok) {
+    return false;
+  }
+
+  memcpy(response, soft_response, response_len);
+  return true;
+}
+
+__attribute__((unused)) static bool
+lr1121_send_command_polled(uint16_t opcode, const uint8_t *params,
+                           uint16_t param_len) {
+  enum { LR1121_COMMAND_BUFFER_MAX = 512 };
+  static uint8_t tx_buf[LR1121_COMMAND_BUFFER_MAX];
+  static uint8_t rx_buf[LR1121_COMMAND_BUFFER_MAX];
+  const uint16_t total_len = 2 + param_len;
+
+  if (total_len > sizeof(tx_buf)) {
+    return false;
+  }
+
+  tx_buf[0] = (uint8_t)((opcode >> 8) & 0xFF);
+  tx_buf[1] = (uint8_t)(opcode & 0xFF);
+  if (params != NULL && param_len > 0) {
+    memcpy(&tx_buf[2], params, param_len);
+  }
+
+  DEBUGOUT("[GP] cmd 0x%04X begin\n", opcode);
+  cs_assert();
+  const bool result = spi_transfer_polled(tx_buf, rx_buf, total_len);
+  cs_deassert();
+  DEBUGOUT("[GP] cmd 0x%04X end ok=%u\n", opcode, result ? 1U : 0U);
+
+  return result;
+}
+
+static bool lr1121_send_command_soft(uint16_t opcode, const uint8_t *params,
+                                     uint16_t param_len) {
+  enum { LR1121_COMMAND_BUFFER_MAX = 512 };
+  static uint8_t tx_buf[LR1121_COMMAND_BUFFER_MAX];
+  const uint16_t total_len = 2 + param_len;
+
+  if (total_len > sizeof(tx_buf)) {
+    return false;
+  }
+
+  tx_buf[0] = (uint8_t)((opcode >> 8) & 0xFF);
+  tx_buf[1] = (uint8_t)(opcode & 0xFF);
+  if (params != NULL && param_len > 0) {
+    memcpy(&tx_buf[2], params, param_len);
+  }
+
+  return soft_spi_transfer_with_cs(tx_buf, NULL, total_len);
+}
+
+__attribute__((unused)) static bool
+lr1121_read_response_polled(uint8_t *response, uint16_t response_len) {
+  enum { LR1121_RESPONSE_BUFFER_MAX = 512 };
+  static uint8_t tx_buf[LR1121_RESPONSE_BUFFER_MAX];
+
+  if (response == NULL || response_len > sizeof(tx_buf)) {
+    return false;
+  }
+
+  memset(tx_buf, 0x00, response_len);
+  memset(response, 0xBB, response_len);
+
+  DEBUGOUT("[GP] resp-polled begin len=%u\n", response_len);
+  cs_assert();
+  const bool result = spi_transfer_polled(tx_buf, response, response_len);
+  cs_deassert();
+  DEBUGOUT("[GP] resp-polled end ok=%u b0=%02X b1=%02X\n", result ? 1U : 0U,
+           response_len > 0 ? response[0] : 0U,
+           response_len > 1 ? response[1] : 0U);
+
+  return result;
+}
+
+bool lr1121_elrs_get_packet(uint8_t *response, uint16_t response_len,
+                            bool use_soft_response) {
+  if (response == NULL || response_len == 0) {
+    return false;
+  }
+
+  /*
+   * Use the ELRS GET_PACKET command with the SiW917 soft response path. The
+   * fused 0x0702 path is stable but returns bytes that fail ELRS CRC for this
+   * receiver flow, while 0x0700 produced accepted packets once the Radio
+   * instance pointer was fixed.
+   */
+  if (!lr1121_wait_busy_timeout(100)) {
+    return false;
+  }
+
+  const bool command_ok =
+      use_soft_response ? lr1121_send_command_soft(0x0700, NULL, 0)
+                        : lr1121_send_command_polled(0x0700, NULL, 0);
+  if (!command_ok) {
+    return false;
+  }
+
+  if (!lr1121_wait_busy_timeout(100)) {
+    return false;
+  }
+
+  return use_soft_response ? lr1121_read_response_soft(response, response_len)
+                           : lr1121_read_response_polled(response, response_len);
+}
+
+bool lr1121_elrs_set_freq_set_rx(uint32_t freq_hz, bool use_soft_command) {
+  const uint8_t params[7] = {
+      (uint8_t)(freq_hz >> 24),
+      (uint8_t)(freq_hz >> 16),
+      (uint8_t)(freq_hz >> 8),
+      (uint8_t)freq_hz,
+      0xFF,
+      0xFF,
+      0xFF,
+  };
+
+  if (!lr1121_wait_busy_timeout(100)) {
+    return false;
+  }
+
+  const bool command_ok =
+      use_soft_command ? lr1121_send_command_soft(0x0701, params, sizeof(params))
+                       : lr1121_send_command(0x0701, params, sizeof(params));
+  if (!command_ok) {
+    return false;
+  }
+
+  return lr1121_wait_busy_timeout(100);
 }
 
 /**
@@ -2023,6 +2398,11 @@ bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
   return spi_transfer(tx_data, rx_data, length);
 }
 
+bool lr1121_spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
+                                uint16_t length) {
+  return spi_transfer_polled(tx_data, rx_data, length);
+}
+
 /*******************************************************************************
  * FIRMWARE UPDATE SUPPORT
  *
@@ -2048,7 +2428,7 @@ static lr1121_update_state_t lr1121_update_state = {0};
  * @brief Write buffered data to LR1121 flash (internal helper)
  */
 static bool lr1121_write_flash_chunk(const uint8_t *data, uint32_t data_size) {
-  uint8_t packet[262]; /* 2B opcode + 4B address + 256B data */
+  static uint8_t packet[262]; /* 2B opcode + 4B address + 256B data */
   uint32_t write_size;
   uint32_t flash_address = lr1121_update_state.total_size;
 

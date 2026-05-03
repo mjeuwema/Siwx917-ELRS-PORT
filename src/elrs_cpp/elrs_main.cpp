@@ -57,6 +57,7 @@ void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
 #define CRSF_RC_OUTPUT_INTERVAL 4 // Output RC channels every 4ms (~250Hz)
 #define RFmodeCycleMultiplierSlow 10
 #define BindingRateChangeCyclePeriodMs 125U
+#define ELRS_DIAG_DISABLE_DOWNLINK_TLM 0
 ///////////////////
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
@@ -139,6 +140,21 @@ uint32_t GotConnectionMillis = 0;
 
 // Phase lock
 int32_t PfdPrevRawOffset = 0;
+static volatile int32_t pfdLastRawOffset = 0;
+static volatile int32_t pfdLastOffset = 0;
+static volatile int32_t pfdLastOffsetDx = 0;
+static volatile int32_t pfdLastPhaseShift = 0;
+static volatile uint32_t pfdResultCount = 0;
+
+enum DisconnectReason : uint8_t {
+  DISC_NONE = 0,
+  DISC_RX_LOCK_TIMEOUT,
+  DISC_PACKET_TIMEOUT,
+  DISC_RATE_CHANGE,
+  DISC_EXTERNAL
+};
+
+static volatile DisconnectReason lastDisconnectReason = DISC_NONE;
 
 // Cycle interval for rate scanning
 uint32_t cycleInterval = 0;
@@ -155,6 +171,8 @@ static uint8_t telemetryBurstCount = 0;
 static uint8_t telemetryBurstMax = 1;
 static bool telemBurstValid = false;
 static bool alreadyTLMresp = false;
+static volatile uint32_t telemetryTxCount = 0;
+static volatile uint32_t telemetrySuppressedCount = 0;
 static volatile bool dataUlReady = false;
 static volatile bool uidSavePending = false;
 static uint8_t pendingUid[UID_LEN] = {0};
@@ -239,7 +257,7 @@ void ChannelDataReset() {
 //=============================================================================
 uint32_t uidMacSeedGet() {
   return ((uint32_t)UID[2] << 24) | ((uint32_t)UID[3] << 16) |
-         ((uint32_t)UID[4] << 8) | UID[5];
+         ((uint32_t)UID[4] << 8) | (UID[5] ^ OTA_VERSION_ID);
 }
 
 static bool use2G4Domain(void) { return firmwareOptions.domain >= 8; }
@@ -316,6 +334,10 @@ static void ICACHE_RAM_ATTR updatePhaseLock() {
     int32_t offset = LPF_Offset.update(rawOffset);
     int32_t offsetDx = LPF_OffsetDx.update(rawOffset - PfdPrevRawOffset);
     PfdPrevRawOffset = rawOffset;
+    pfdLastRawOffset = rawOffset;
+    pfdLastOffset = offset;
+    pfdLastOffsetDx = offsetDx;
+    pfdResultCount++;
 
     if (RXtimerState == tim_locked && (OtaNonce % 8 == 0)) {
       if (offset > 0) {
@@ -325,11 +347,14 @@ static void ICACHE_RAM_ATTR updatePhaseLock() {
       }
     }
 
+    int32_t phaseShift = 0;
     if (connectionState != connected) {
-      hwTimer::phaseShift(rawOffset >> 1);
+      phaseShift = rawOffset >> 1;
     } else {
-      hwTimer::phaseShift(offset >> 2);
+      phaseShift = offset >> 2;
     }
+    pfdLastPhaseShift = phaseShift;
+    hwTimer::phaseShift(phaseShift);
 
     (void)offsetDx;
   }
@@ -367,7 +392,9 @@ static void ICACHE_RAM_ATTR HWtimerCallbackTock() {
   PFDloop.intEvent(micros());
   OtaNonce++;
   HandleFHSS();
-  (void)HandleSendDataDl();
+  if (HandleSendDataDl()) {
+    telemetryTxCount++;
+  }
   updatePhaseLock();
 }
 
@@ -375,6 +402,7 @@ static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now) {
   PFDloop.reset();
   setConnectionState(tentative);
   connectionHasModelMatch = false;
+  lastDisconnectReason = DISC_NONE;
   RXtimerState = tim_disconnected;
   PfdPrevRawOffset = 0;
   GotConnectionMillis = 0;
@@ -396,6 +424,18 @@ static void GotConnection(unsigned long now) {
 }
 
 static void LostConnection(bool resumeRx) {
+  if (lastDisconnectReason == DISC_NONE) {
+    lastDisconnectReason = DISC_EXTERNAL;
+  }
+
+  DBGLN("LostConnection reason=%u age=%lu pfd raw=%ld off=%ld dx=%ld phase=%ld "
+        "fo=%ld nonce=%u fhss=%u",
+        (unsigned)lastDisconnectReason,
+        (unsigned long)(millis() - LastValidPacket),
+        (long)pfdLastRawOffset, (long)pfdLastOffset, (long)pfdLastOffsetDx,
+        (long)pfdLastPhaseShift, (long)hwTimer::FreqOffset, OtaNonce,
+        FHSSgetCurrIndex());
+
   setConnectionState(disconnected);
   RXtimerState = tim_disconnected;
   PfdPrevRawOffset = 0;
@@ -561,6 +601,14 @@ ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
 static uint32_t crcFailCount = 0;
 static uint32_t crcPassCount = 0;
 static uint32_t lastCrcDebugTime = 0;
+static volatile uint32_t crcFailTypeCount[4] = {};
+static volatile uint32_t crcPassTypeCount[4] = {};
+static volatile uint8_t lastValidPacketType = 0xFF;
+static volatile uint8_t lastValidExpectedNonce = 0;
+static volatile uint8_t lastValidExpectedFhss = 0;
+static volatile uint8_t lastValidSyncNonce = 0xFF;
+static volatile uint8_t lastValidSyncFhss = 0xFF;
+static volatile uint32_t lastValidFreq = 0;
 
 static bool ICACHE_RAM_ATTR
 ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
@@ -572,14 +620,21 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   uint32_t const now = millis();
 
   OTA_Packet_s *const otaPktPtr = (OTA_Packet_s *const)Radio.RXdataBuffer;
+  uint8_t const type = Radio.RXdataBuffer[0] & 0x03;
 
   // Validate CRC
   if (!OtaValidatePacketCrc(otaPktPtr)) {
     crcFailCount++;
+    crcFailTypeCount[type]++;
     return false;
   }
 
   crcPassCount++;
+  crcPassTypeCount[type]++;
+  lastValidPacketType = type;
+  lastValidExpectedNonce = OtaNonce;
+  lastValidExpectedFhss = FHSSgetCurrIndex();
+  lastValidFreq = Radio.currFreq;
 
   if (ExpressLRS_currAirRate_Modparams != nullptr &&
       ExpressLRS_currAirRate_RFperfParams != nullptr) {
@@ -593,9 +648,6 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
     PFDloop.extEvent(beginProcessing + slack);
   }
 
-  // Get packet type (low 2 bits of first byte)
-  uint8_t const type = Radio.RXdataBuffer[0] & 0x03;
-
   // Capture this packet
   uint32_t cidx = pkt_capture_idx % PKT_CAPTURE_SIZE;
   memcpy((void *)pkt_capture_buf[cidx], (void *)Radio.RXdataBuffer, 8);
@@ -605,6 +657,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
 
   // Update link quality and RSSI
   LQCalc.add();
+  Radio.GetLastPacketStats();
   getRFlinkInfo();
   RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
 
@@ -622,6 +675,8 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   case PACKET_TYPE_SYNC: {
     OTA_Sync_s const *const sync =
         OtaIsFullRes ? &otaPktPtr->full.sync.sync : &otaPktPtr->std.sync;
+    lastValidSyncNonce = sync->nonce;
+    lastValidSyncFhss = sync->fhssIndex;
     doStartTimer = ProcessRfPacket_SYNC(now, sync) && !InBindingMode;
     break;
   }
@@ -644,6 +699,10 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
 // Radio ISR callbacks
 //=============================================================================
 static bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
+  if (LQCalc.currentIsSet() && connectionState == connected) {
+    return false;
+  }
+
   if (ProcessRFPacket(rxStatus)) {
     if (doStartTimer && !hwTimer::isRunning()) {
       doStartTimer = false;
@@ -674,9 +733,6 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
 
   // Binding always uses invertIQ
   bool invertIQ = bindMode || (UID[5] & 0x01);
-  // DIAGNOSTIC: force invertIQ=1 to match standalone RX test (which receives
-  // packets from the bench TX). Revert once UID/bind state is confirmed.
-  invertIQ = true;
 
   uint32_t interval = ModParams->interval;
   hwTimer::updateInterval(interval);
@@ -721,6 +777,15 @@ static bool ICACHE_RAM_ATTR HandleSendDataDl() {
       ((OtaNonce % ExpressLRS_currTlmDenom) != 0)) {
     return false;
   }
+
+#if ELRS_DIAG_DISABLE_DOWNLINK_TLM
+  // Isolation test: reserve the telemetry slot without keying the LR1121 TX.
+  // This preserves LQ timing while proving whether TX/TX_DONE/RX return causes
+  // the post-connect packet loss.
+  alreadyTLMresp = true;
+  telemetrySuppressedCount++;
+  return false;
+#endif
 
   WORD_ALIGNED_ATTR OTA_Packet_s otaPkt = {};
   alreadyTLMresp = true;
@@ -1041,10 +1106,7 @@ void elrs_loop(void) {
   // The ISR only sets a flag (no SPI). We process it here where SPI is safe.
   LR1121Hal::handleDeferredISR();
 
-  // Automatically dump packets once we have collected enough
-  if (pkt_capture_count == 15 && !do_packet_dump) {
-    do_packet_dump = true;
-  }
+  unsigned long now = millis();
 
   if (do_packet_dump) {
     do_packet_dump = false;
@@ -1062,19 +1124,35 @@ void elrs_loop(void) {
     uint32_t lastIrq = 0;
     lr1121_get_isr_stats(&isrCount, &rxIrqCount, &txIrqCount, &otherIrqCount,
                          &lastIrq);
-    (void)txIrqCount;
-    (void)otherIrqCount;
-
-    DBGLN("ISR:%lu RXirq:%lu RXok:%lu CRCfail:%lu conn:%d rate:%d freq:%lu "
-          "DIO1:%d IRQ:0x%08lX",
-          isrCount, rxIrqCount, pkt_capture_count, crcFailCount, connectionState,
+    DBGLN("ISR:%lu RXirq:%lu TXirq:%lu other:%lu RXok:%lu CRCfail:%lu "
+          "conn:%d rxst:%d rate:%d "
+          "freq:%lu DIO1:%d IRQ:0x%08lX age:%lu nonce:%u fhss:%u pfd:%ld/%ld/"
+          "%ld ph:%ld fo:%ld lq:%u/%u rssi:%d snr:%d tlm:%lu/%lu den:%u "
+          "okT:%lu/%lu/%lu failT:%lu/%lu/%lu last:%u exp:%u/%u sync:%u/%u "
+          "vf:%lu disc:%u",
+          isrCount, rxIrqCount, txIrqCount, otherIrqCount, pkt_capture_count,
+          crcFailCount, connectionState, RXtimerState,
           ExpressLRS_currAirRate_Modparams
               ? ExpressLRS_currAirRate_Modparams->index
               : 0,
-          Radio.currFreq, lr1121_dio1_read(), lastIrq);
+          Radio.currFreq, lr1121_dio1_read(), lastIrq,
+          (unsigned long)(now - LastValidPacket), OtaNonce, FHSSgetCurrIndex(),
+          (long)pfdLastRawOffset, (long)pfdLastOffset,
+          (long)pfdLastOffsetDx, (long)pfdLastPhaseShift,
+          (long)hwTimer::FreqOffset, LQCalc.getLQRaw(), LQCalc.getCount(),
+          Radio.LastPacketRSSI, Radio.LastPacketSNRRaw,
+          (unsigned long)telemetryTxCount,
+          (unsigned long)telemetrySuppressedCount, ExpressLRS_currTlmDenom,
+          (unsigned long)crcPassTypeCount[PACKET_TYPE_RCDATA],
+          (unsigned long)crcPassTypeCount[PACKET_TYPE_DATA],
+          (unsigned long)crcPassTypeCount[PACKET_TYPE_SYNC],
+          (unsigned long)crcFailTypeCount[PACKET_TYPE_RCDATA],
+          (unsigned long)crcFailTypeCount[PACKET_TYPE_DATA],
+          (unsigned long)crcFailTypeCount[PACKET_TYPE_SYNC],
+          lastValidPacketType, lastValidExpectedNonce, lastValidExpectedFhss,
+          lastValidSyncNonce, lastValidSyncFhss, (unsigned long)lastValidFreq,
+          (unsigned)lastDisconnectReason);
   }
-
-  unsigned long now = millis();
 
   updateTelemetryBurst();
 
@@ -1100,20 +1178,24 @@ void elrs_loop(void) {
   if ((connectionState == tentative) &&
       ((now - LastSyncPacket) >
        ExpressLRS_currAirRate_RFperfParams->RxLockTimeoutMs)) {
+    lastDisconnectReason = DISC_RX_LOCK_TIMEOUT;
     LostConnection(true);
   }
 
   // Connection timeout check
-  if (connectionState != disconnected) {
+  if (connectionState == connected) {
     uint32_t disconnectTimeout =
         ExpressLRS_currAirRate_RFperfParams->DisconnectTimeoutMs;
     if ((now - LastValidPacket) > disconnectTimeout) {
+      lastDisconnectReason = DISC_PACKET_TIMEOUT;
       LostConnection(true);
     }
   }
 
   // Rate change handling
-  if (ExpressLRS_nextAirRateIndex != ExpressLRS_currAirRate_Modparams->index) {
+  if ((connectionState != disconnected) &&
+      (ExpressLRS_nextAirRateIndex != ExpressLRS_currAirRate_Modparams->index)) {
+    lastDisconnectReason = DISC_RATE_CHANGE;
     LostConnection(true);
   }
 

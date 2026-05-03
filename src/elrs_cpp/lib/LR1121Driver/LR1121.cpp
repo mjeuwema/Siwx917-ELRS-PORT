@@ -19,6 +19,7 @@ extern "C" {
 
 LR1121Hal hal;
 LR1121Driver *LR1121Driver::instance = NULL;
+static volatile uint8_t siw917_last_payload_length = 8;
 
 static int UpdateFirmwareWithCDriver(
     const SX12XX_Radio_Number_t radioNumber) {
@@ -304,6 +305,9 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
               radioNumber); // Must be called after changing rf modes between
                             // subG and 2.4G.  This sets the correct rf amps,
                             // and txen pins to be used.
+  if (PayloadLength > 0) {
+    siw917_last_payload_length = PayloadLength;
+  }
   pwrForceUpdate =
       true; // force an update of the output power because the band may have
             // changed, and we need to configure the power for the band.
@@ -836,11 +840,14 @@ inline void ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
 }
 
 bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
+  const uint8_t effectivePayloadLength =
+      PayloadLength != 0 ? PayloadLength : siw917_last_payload_length;
+
   // GetPacket
   hal.WriteCommand(LR11XX_RADIO_GET_PACKET, radioNumber);
-  hal.ReadCommand(rx_buf, PayloadLength + 6, radioNumber);
+  hal.ReadCommand(rx_buf, effectivePayloadLength + 6, radioNumber);
 
-  codec->decode(RXdataBuffer, rx_buf + 6, PayloadLength);
+  codec->decode(RXdataBuffer, rx_buf + 6, effectivePayloadLength);
   if (!RXdoneCallback(SX12XX_RX_OK)) {
 #if defined(DEBUG_RCVR_SIGNAL_STATS)
     rxSignalStats[radioNumber == SX12XX_Radio_1 ? 0 : 1].fail_count++;

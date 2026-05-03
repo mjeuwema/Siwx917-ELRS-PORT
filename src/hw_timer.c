@@ -593,6 +593,12 @@ void hw_timer_resume(void) {
   }
 }
 
+void hw_timer_note_immediate_tock(void) {
+  uint32_t primask = hw_timer_enter_critical();
+  hw_timer.is_tock = false;
+  hw_timer_exit_critical(primask);
+}
+
 /**
  * @brief Get current timestamp in microseconds
  * @return Monotonic timestamp in microseconds

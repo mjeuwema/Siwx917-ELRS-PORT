@@ -56,7 +56,8 @@ public:
     /**
      * @brief Read data from selected radio
      * @param cs_mask Radio selection
-     * @param data Buffer to read into (sent as NOP)
+     * @param data Full-duplex buffer: contents are sent on MOSI and replaced
+     *             with MISO bytes, matching upstream ELRS SPIEx semantics.
      * @param size Number of bytes
      */
     void read(uint8_t cs_mask, uint8_t *data, uint32_t size);

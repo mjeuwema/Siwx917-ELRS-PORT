@@ -30,6 +30,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /*******************************************************************************
  * Local Variables
@@ -562,6 +563,14 @@ int elrs_config_from_json(const char* json, size_t json_len)
   if (json == NULL || json_len == 0) {
     return -1;
   }
+
+  char* json_owned = (char*)malloc(json_len + 1);
+  if (json_owned == NULL) {
+    return -1;
+  }
+  memcpy(json_owned, json, json_len);
+  json_owned[json_len] = '\0';
+  json = json_owned;
   
   /* 
    * Parse binding phrase if present (takes priority over raw UID)
@@ -741,7 +750,8 @@ parse_other_fields:
   
   /* Mark as valid */
   g_config.flags |= ELRS_CONFIG_FLAG_VALID;
-  
+
+  free(json_owned);
   return 0;
 }
 

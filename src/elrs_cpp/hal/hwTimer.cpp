@@ -104,15 +104,34 @@ void hwTimer::resume() {
   if (running)
     return;
 
-  // Start fresh - tock should fire first
+  // Match upstream RX behavior: the first TOCK happens as soon as the current
+  // radio callback has recorded its packet reference, then hardware continues
+  // with the following TICK.
   isTick = false;
   PhaseShift = 0;
 
-  // Start the CT timer
-  hw_timer_start();
+  sl_status_t status = hw_timer_start();
+  if (status != SL_STATUS_OK) {
+    running = false;
+    DBGLN("hwTimer resume failed: 0x%04X", (unsigned)status);
+    return;
+  }
+
   running = true;
+  isTick = false;
+  hw_timer_note_immediate_tock();
 
   DBGLN("hwTimer resumed, interval=%lu us", HWtimerInterval);
+
+  if (callbackTock) {
+    callbackTock();
+  }
+
+  isTick = true;
+}
+
+void hwTimer::service() {
+  // Kept for compatibility with the ELRS task loop.
 }
 
 void hwTimer::updateInterval(uint32_t newTimerInterval) {

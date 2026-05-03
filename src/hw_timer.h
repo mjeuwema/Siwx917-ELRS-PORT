@@ -132,6 +132,15 @@ void hw_timer_pause(void);
 void hw_timer_resume(void);
 
 /**
+ * @brief Mark that the platform wrapper already delivered the immediate TOCK.
+ *
+ * ESP32 ELRS gets an immediate timer interrupt when resume() enables the alarm.
+ * The SiW917 wrapper emulates that by calling the TOCK callback directly, so
+ * the C timer state must be advanced to make the next hardware edge a TICK.
+ */
+void hw_timer_note_immediate_tock(void);
+
+/**
  * @brief Pause the CT timer ISR to prevent SPI reentrancy
  *
  * This masks the CT IRQ so it becomes pending instead of firing,

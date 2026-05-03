@@ -18,6 +18,13 @@ extern "C" {
 SPIClass SPI;
 SPIExClass SPIEx;
 
+namespace {
+constexpr size_t kSpiScratchSize = 512;
+uint8_t gTransferWriteDummy[kSpiScratchSize];
+uint8_t gTransferReadBuf[kSpiScratchSize];
+uint8_t gSpiexWriteDummy[kSpiScratchSize];
+} // namespace
+
 //-----------------------------------------------------------------------------
 // SPIClass Implementation
 //-----------------------------------------------------------------------------
@@ -35,21 +42,20 @@ void SPIClass::transfer(void *buf, size_t count) {
 }
 
 void SPIClass::transferBytes(const uint8_t *tx, uint8_t *rx, size_t count) {
-  if (count == 0) return;
+  if (count == 0)
+    return;
+
   if (rx != nullptr) {
     // Full duplex: separate tx and rx buffers
     lr1121_spi_transfer(tx, rx, count);
   } else {
-    // Write-only: use a temporary dummy buffer so tx data is NOT overwritten.
-    // This is critical for firmware updates — the ESP32's transferBytes(tx, nullptr, n)
-    // does a write-only DMA transfer that preserves the source buffer.
-    uint8_t dummy[262];  // 6 header + 256 payload max
-    if (count <= sizeof(dummy)) {
-      lr1121_spi_transfer(tx, dummy, count);
+    // Write-only: use a shared dummy buffer so tx data is NOT overwritten
+    // without putting a large scratch buffer on the task stack.
+    if (count <= sizeof(gTransferWriteDummy)) {
+      lr1121_spi_transfer(tx, gTransferWriteDummy, count);
     } else {
-      // Fallback for unexpectedly large transfers
       for (size_t i = 0; i < count; i++) {
-        uint8_t d;
+        uint8_t d = 0;
         lr1121_spi_transfer(&tx[i], &d, 1);
       }
     }
@@ -73,6 +79,7 @@ void SPIExClass::_transfer(uint8_t cs_mask, uint8_t *data, uint32_t size,
   // cs_mask indicates which radio(s) to select:
   // SX12XX_Radio_1 = 0x01, SX12XX_Radio_2 = 0x02, SX12XX_Radio_All = 0x03
   // For SiW917 we only support Radio_1
+  (void)cs_mask;
 
   if (size == 0)
     return;
@@ -82,26 +89,23 @@ void SPIExClass::_transfer(uint8_t cs_mask, uint8_t *data, uint32_t size,
 
   if (reading) {
     // Read operation: send data as dummy, receive response
-    uint8_t rx_buf[256];
-    if (size <= sizeof(rx_buf)) {
-      lr1121_spi_transfer(data, rx_buf, size);
-      memcpy(data, rx_buf, size);
+    if (size <= sizeof(gTransferReadBuf)) {
+      lr1121_spi_transfer(data, gTransferReadBuf, size);
+      memcpy(data, gTransferReadBuf, size);
     } else {
-      // Larger transfers: do in chunks
       for (uint32_t i = 0; i < size; i++) {
-        uint8_t rx;
+        uint8_t rx = 0;
         lr1121_spi_transfer(&data[i], &rx, 1);
         data[i] = rx;
       }
     }
   } else {
     // Write operation: send data, ignore response
-    uint8_t dummy[256];
-    if (size <= sizeof(dummy)) {
-      lr1121_spi_transfer(data, dummy, size);
+    if (size <= sizeof(gSpiexWriteDummy)) {
+      lr1121_spi_transfer(data, gSpiexWriteDummy, size);
     } else {
       for (uint32_t i = 0; i < size; i++) {
-        uint8_t rx;
+        uint8_t rx = 0;
         lr1121_spi_transfer(&data[i], &rx, 1);
       }
     }

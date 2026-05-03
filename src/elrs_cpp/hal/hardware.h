@@ -50,7 +50,7 @@
 //=============================================================================
 // LED Pins
 //=============================================================================
-#define GPIO_PIN_LED        11    // SiW917 DevKit onboard LED
+#define GPIO_PIN_LED        10    // SiW917 DevKit onboard LED
 #define GPIO_PIN_LED_RED    UNDEF_PIN
 #define GPIO_PIN_LED_GREEN  GPIO_PIN_LED
 #define GPIO_PIN_LED_BLUE   UNDEF_PIN

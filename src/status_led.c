@@ -53,6 +53,16 @@
  ******************************************************************************/
 
 /**
+ * EGPIO clocks are disabled at reset on SiWx917. The radio driver also enables
+ * them later for DIO1, but the status LED is initialized before the radio.
+ */
+#define M4CLK_BASE                  0x46000000UL
+#define CLK_ENABLE_SET_REG2         (*(volatile uint32_t *)(M4CLK_BASE + 0x008))
+#define CLK_ENABLE_SET_REG3         (*(volatile uint32_t *)(M4CLK_BASE + 0x010))
+#define EGPIO_PCLK_ENABLE_BIT       (1UL << 21)
+#define EGPIO_CLK_ENABLE_BIT        (1UL << 16)
+
+/**
  * SoC and ULP GPIO Pad Control Selection Register Base
  * Citation: siw917x-family-rm.pdf Section 11.3 "SoC and ULP GPIO Pad Control Selection Register Map"
  *   Base address: 0x4130_0000
@@ -190,6 +200,11 @@ int status_led_init(void)
 {
     LED_DBG("Initializing status LED (LED0 only)...\n");
     LED_DBG("  NOTE: LED1 (ULP_GPIO_2) not used - conflicts with LR1121 DIO1\n");
+
+    /* Enable EGPIO clocks before touching GPIO config/output registers. */
+    CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT;
+    CLK_ENABLE_SET_REG3 = EGPIO_CLK_ENABLE_BIT;
+    LED_DBG("  EGPIO clocks enabled for LED0\n");
     
     /***************************************************************************
      * LED0 Configuration (GPIO_10)

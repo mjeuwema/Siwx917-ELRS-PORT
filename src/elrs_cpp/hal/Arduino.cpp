@@ -165,11 +165,21 @@ void detachInterrupt(int pin) {
 // These are required when using C++ classes with virtual destructors
 // but not using the full C++ standard library
 void* operator new(size_t size) {
-    return malloc(size);
+    void* ptr = malloc(size);
+    if (ptr == nullptr) {
+        std::fputs("fatal: operator new failed\n", stderr);
+        std::abort();
+    }
+    return ptr;
 }
 
 void* operator new[](size_t size) {
-    return malloc(size);
+    void* ptr = malloc(size);
+    if (ptr == nullptr) {
+        std::fputs("fatal: operator new[] failed\n", stderr);
+        std::abort();
+    }
+    return ptr;
 }
 
 void operator delete(void* ptr) noexcept {

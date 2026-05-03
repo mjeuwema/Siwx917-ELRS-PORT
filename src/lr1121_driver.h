@@ -412,6 +412,51 @@ bool lr1121_send_command(uint16_t opcode, const uint8_t *params,
 bool lr1121_read_response(uint8_t *response, uint16_t response_len);
 
 /**
+ * @brief Read a response using bit-banged GPIO instead of the GSPI SDK.
+ *
+ * This is a narrow recovery path for LR1121 response phases where the SDK GSPI
+ * transfer can block after an RX_DONE event. The command phase should already
+ * have completed and BUSY should already be LOW.
+ *
+ * @param response Buffer to store response
+ * @param response_len Number of bytes to read
+ * @return true on success
+ */
+bool lr1121_read_response_soft(uint8_t *response, uint16_t response_len);
+
+/**
+ * @brief Execute the ELRS LR1121 custom GetPacket opcode (0x0700).
+ *
+ * This opcode is provided by the ELRS LR1121 transceiver firmware (F3xx) and
+ * returns packet metadata plus payload in one response. The helper keeps the
+ * command framing centralized so the C++ ELRS driver can fall back cleanly if
+ * the SiW917 GSPI path cannot complete the transaction.
+ *
+ * @param response Buffer to store metadata + packet bytes
+ * @param response_len Number of bytes to read
+ * @param use_soft_response Use GPIO bit-banged clocking for the response phase;
+ *                          otherwise use the polled/bare-metal GSPI path
+ * @return true on success
+ */
+bool lr1121_elrs_get_packet(uint8_t *response, uint16_t response_len,
+                            bool use_soft_response);
+
+/**
+ * @brief Execute the ELRS LR1121 custom SetRfFrequency_SetRx opcode (0x0701).
+ *
+ * The ELRS LR1121 transceiver firmware provides this helper so FHSS hopping can
+ * retune and re-enter continuous RX in one radio command. On SiW917, using the
+ * same soft GPIO SPI path as custom GetPacket avoids GSPI SDK transaction
+ * timing problems in the tight hop window.
+ *
+ * @param freq_hz Target RF frequency in Hz
+ * @param use_soft_command Use GPIO bit-banged clocking for the command phase;
+ *                         otherwise use the normal GSPI command path
+ * @return true on success
+ */
+bool lr1121_elrs_set_freq_set_rx(uint32_t freq_hz, bool use_soft_command);
+
+/**
  * @brief Get LR1121 status bytes
  *
  * Citation: LR1121 User Manual Section 2.1 (Status Byte)
@@ -509,6 +554,16 @@ void lr1121_cs_deassert(void);
  */
 bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
                          uint16_t length);
+
+/**
+ * @brief Raw full-duplex SPI transfer using the polled/bare-metal GSPI path.
+ *
+ * Caller must handle CS assertion/deassertion. This is intended for hot-path
+ * ELRS LR1121 transactions where the Silicon Labs interrupt-driven GSPI driver
+ * can contend with DIO/timer timing.
+ */
+bool lr1121_spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
+                                uint16_t length);
 
 /*******************************************************************************
  * Firmware Version Structure (for OTA updates)
