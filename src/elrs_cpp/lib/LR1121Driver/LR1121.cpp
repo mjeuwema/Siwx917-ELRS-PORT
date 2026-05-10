@@ -842,19 +842,25 @@ inline void ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
 bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
   const uint8_t effectivePayloadLength =
       PayloadLength != 0 ? PayloadLength : siw917_last_payload_length;
+  bool packetAccepted = false;
 
   // GetPacket
   hal.WriteCommand(LR11XX_RADIO_GET_PACKET, radioNumber);
   hal.ReadCommand(rx_buf, effectivePayloadLength + 6, radioNumber);
 
   codec->decode(RXdataBuffer, rx_buf + 6, effectivePayloadLength);
-  if (!RXdoneCallback(SX12XX_RX_OK)) {
+  packetAccepted = RXdoneCallback(SX12XX_RX_OK);
+  if (!packetAccepted) {
 #if defined(DEBUG_RCVR_SIGNAL_STATS)
     rxSignalStats[radioNumber == SX12XX_Radio_1 ? 0 : 1].fail_count++;
 #endif
-    return false;
   }
-  return true;
+
+  // The SiW917/LR1121 path appears to leave RX after RX_DONE often enough that
+  // relying on the 0xFFFFFF "continuous" timeout causes sparse RX interrupts
+  // and eventual link timeout. Re-arm RX explicitly after every packet read.
+  RXnb();
+  return packetAccepted;
 }
 
 void ICACHE_RAM_ATTR LR1121Driver::RXnb() {

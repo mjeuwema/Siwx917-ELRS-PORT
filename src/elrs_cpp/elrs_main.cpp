@@ -376,7 +376,10 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
     return;
   }
 
-  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, false);
+  // On SiW917/LR1121, separate SetRfFrequency + SetRx leaves a timing gap on
+  // every FHSS hop. Use the LR1121 fused helper so the radio re-enters RX in
+  // the same command boundary.
+  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, true);
 }
 
 static void ICACHE_RAM_ATTR HWtimerCallbackTick() {
@@ -684,12 +687,6 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   case PACKET_TYPE_DATA:
     ProcessRfPacket_DataUl(otaPktPtr);
     break;
-  }
-
-  if ((connectionState == tentative) && (LPF_OffsetDx.value() <= 10) &&
-      (LPF_OffsetDx.value() >= -10) && (LPF_Offset.value() < 100) &&
-      (LQCalc.getLQRaw() > minLqForChaos())) {
-    GotConnection(now);
   }
 
   return true;
@@ -1197,6 +1194,25 @@ void elrs_loop(void) {
       (ExpressLRS_nextAirRateIndex != ExpressLRS_currAirRate_Modparams->index)) {
     lastDisconnectReason = DISC_RATE_CHANGE;
     LostConnection(true);
+  }
+
+  if (connectionState == tentative) {
+    const bool lqLooksReal = LQCalc.getLQRaw() > minLqForChaos();
+    const bool pfdLooksStable = (LPF_OffsetDx.value() <= 10) &&
+                                (LPF_OffsetDx.value() >= -10) &&
+                                (LPF_Offset.value() < 100);
+    const uint32_t freshPacketWindow =
+        (ExpressLRS_currAirRate_Modparams->interval / 1000U) * 3U;
+    const bool crcLocked =
+        lqLooksReal && LastValidPacket != 0 &&
+        ((now - LastValidPacket) <= freshPacketWindow);
+
+    // SiW917 has noticeably noisier PFD measurements while SPI and the CT
+    // timer are both active. CRC-valid bound packets are a stronger signal
+    // than the early PFD derivative, so do not strand the RX in tentative.
+    if (lqLooksReal && (pfdLooksStable || crcLocked)) {
+      GotConnection(now);
+    }
   }
 
   if ((RXtimerState == tim_tentative) &&

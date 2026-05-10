@@ -58,7 +58,14 @@
  */
 // #define USE_SOFT_SPI
 
-#define LR1121_GSPI_BITRATE_HZ 8000000U
+#define LR1121_GSPI_BITRATE_HZ 2000000U
+
+/*
+ * Slower edge timing for SiW917 GPIO-driven SPI fallback paths. The hardware
+ * GSPI bitrate above is exact; this loop-based path is intentionally
+ * conservative to make logic-analyzer captures cleaner.
+ */
+#define LR1121_SOFT_SPI_EDGE_DELAY_LOOPS 48
 
 #include <stdbool.h>
 #include <string.h>
@@ -226,6 +233,9 @@
 /* Note: PAD_CONFIG_REG is already defined in rsi_egpio.h, using it directly */
 #define PADCONFIG_REN_BIT (1UL << 4) /* Receiver Enable */
 #define PADCONFIG_SMT_BIT (1UL << 3) /* Schmitt Trigger */
+#define PADCONFIG_SR_BIT (1UL << 5)  /* Slew Rate */
+#define PADCONFIG_DRIVE_MASK 0x3UL
+#define PADCONFIG_DRIVE_4MA 0x1UL
 
 /* GSPI Peripheral Registers for Full-Duplex Mode
  * Citation: siw917x-family-rm.pdf Section 20.4 "GSPI Primary Register Map"
@@ -267,6 +277,22 @@
 static sl_gspi_handle_t gspi_handle = NULL;
 static volatile bool gspi_transfer_complete = false;
 static bool driver_initialized = false;
+
+static void configure_output_pad_slow(uint8_t pin) {
+  uint32_t pad = PAD_CONFIG_REG(pin);
+
+  /* Output pins only: disable input receiver, use 4mA drive, low slew. */
+  pad &= ~(PADCONFIG_DRIVE_MASK | PADCONFIG_REN_BIT | PADCONFIG_SR_BIT);
+  pad |= PADCONFIG_DRIVE_4MA;
+  PAD_CONFIG_REG(pin) = pad;
+}
+
+static void configure_lr1121_output_pads_slow(void) {
+  configure_output_pad_slow(LR1121_PIN_SCK);
+  configure_output_pad_slow(LR1121_PIN_MOSI);
+  configure_output_pad_slow(LR1121_PIN_NSS);
+  configure_output_pad_slow(LR1121_PIN_RST);
+}
 
 /*******************************************************************************
  * GSPI Callback
@@ -389,8 +415,7 @@ static void configure_gpio_pads(void) {
 
   /* Configure GPIO_25 (SCK) and GPIO_27 (MOSI) for output */
   /* Clear REN (Receiver Enable) to ensure output mode */
-  PAD_CONFIG_REG(25) &= ~PADCONFIG_REN_BIT;
-  PAD_CONFIG_REG(27) &= ~PADCONFIG_REN_BIT;
+  configure_lr1121_output_pads_slow();
 
   /* Enable receiver on GPIO_29 (BUSY) - input pin
    * Per Table 11.3, GPIO_26-29 have REN=1 at reset, but enable explicitly
@@ -445,9 +470,13 @@ static void configure_gpio_pads(void) {
   /* Enable receiver on BUSY (GPIO_29) */
   PAD_CONFIG_REG(29) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
 
+  /* Reduce SiW917 output drive and slew for cleaner SPI captures. */
+  configure_lr1121_output_pads_slow();
+
   DEBUGOUT("  PAD_CONFIG_REG(26/MISO) = 0x%08lX (REN=%d)\n",
            (unsigned long)PAD_CONFIG_REG(26),
            (PAD_CONFIG_REG(26) & PADCONFIG_REN_BIT) ? 1 : 0);
+  DEBUGOUT("  SPI output pads: 4mA drive, low slew (SCK/MOSI/NSS/RST)\n");
 #endif
   DEBUGOUT("LR1121: GPIO pads configured\n");
 }
@@ -1100,6 +1129,10 @@ lr1121_status_t lr1121_init(void) {
   DEBUGOUT("LR1121: GSPI configured: %lu Hz, Mode 0, 8-bit, div=%lu\n",
            (unsigned long)gspi_config.bitrate,
            (unsigned long)sl_si91x_gspi_get_clock_division_factor(gspi_handle));
+
+  /* The SDK pin setup may rewrite PAD_CONFIG, so enforce the SI-friendly
+   * output settings again after GSPI configuration. */
+  configure_lr1121_output_pads_slow();
 
   /* Step 3: Register callback */
   status =
@@ -1815,16 +1848,9 @@ void lr1121_gpio_toggle_test(uint32_t cycles) {
   DEBUGOUT("  HOST_PADS_GPIO_MODE bits[18:14] = 0x%lX (should be 0x1F)\n",
            (unsigned long)((MCR_GENERIC_CTRL_1_REG >> 14) & 0x1F));
 
-  /* Set high drive strength for output pins (E = 3 = 12mA) */
-  DEBUGOUT("\nSetting PAD_CONFIG drive strength (12mA) for outputs...\n");
-  PAD_CONFIG_REG(LR1121_PIN_SCK) =
-      (PAD_CONFIG_REG(LR1121_PIN_SCK) & ~0x3) | 0x3; /* 12mA */
-  PAD_CONFIG_REG(LR1121_PIN_MOSI) =
-      (PAD_CONFIG_REG(LR1121_PIN_MOSI) & ~0x3) | 0x3; /* 12mA */
-  PAD_CONFIG_REG(LR1121_PIN_NSS) =
-      (PAD_CONFIG_REG(LR1121_PIN_NSS) & ~0x3) | 0x3; /* 12mA */
-  PAD_CONFIG_REG(LR1121_PIN_RST) =
-      (PAD_CONFIG_REG(LR1121_PIN_RST) & ~0x3) | 0x3; /* 12mA */
+  /* Match normal LR1121 init: 4mA drive, low slew for output pins. */
+  DEBUGOUT("\nSetting PAD_CONFIG drive strength (4mA, low slew) for outputs...\n");
+  configure_lr1121_output_pads_slow();
 
   /* Dump all GPIO configuration registers for debugging */
   DEBUGOUT("\n=== Complete GPIO Register Dump ===\n");
@@ -2130,20 +2156,20 @@ static bool soft_spi_transfer_with_cs(const uint8_t *tx_data, uint8_t *rx_data,
       } else {
         HP_GPIO_SET_LOW(LR1121_PIN_MOSI);
       }
-      for (volatile int d = 0; d < 12; d++) {
+      for (volatile int d = 0; d < LR1121_SOFT_SPI_EDGE_DELAY_LOOPS; d++) {
       }
 
       HP_GPIO_SET_HIGH(LR1121_PIN_SCK);
-      for (volatile int d = 0; d < 12; d++) {
+      for (volatile int d = 0; d < LR1121_SOFT_SPI_EDGE_DELAY_LOOPS; d++) {
       }
       if (HP_GPIO_READ(LR1121_PIN_MISO)) {
         rx_byte |= (uint8_t)(1U << bit);
       }
 
-      for (volatile int d = 0; d < 12; d++) {
+      for (volatile int d = 0; d < LR1121_SOFT_SPI_EDGE_DELAY_LOOPS; d++) {
       }
       HP_GPIO_SET_LOW(LR1121_PIN_SCK);
-      for (volatile int d = 0; d < 12; d++) {
+      for (volatile int d = 0; d < LR1121_SOFT_SPI_EDGE_DELAY_LOOPS; d++) {
       }
     }
 

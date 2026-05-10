@@ -41,6 +41,10 @@ static volatile uint16_t last_command_opcode = 0;
 static volatile bool rx_continuous_active = false;
 static volatile bool pending_rx_retune = false;
 
+// Diagnostic toggle: keep the ELRS LR1121 fused SetFreq+Rx helper enabled by
+// default. Disabling it made phase error much worse on SiW917.
+#define ELRS_DIAG_DISABLE_FUSED_RX_RETUNE 0
+
 extern LR1121Driver Radio;
 
 // Static instance pointer
@@ -178,7 +182,8 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     return;
   }
 
-  if (opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC && pending_rx_retune &&
+  if (!ELRS_DIAG_DISABLE_FUSED_RX_RETUNE &&
+      opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC && pending_rx_retune &&
       buffer != nullptr && size >= 4) {
     const uint32_t freq_hz = ((uint32_t)buffer[0] << 24) |
                              ((uint32_t)buffer[1] << 16) |
