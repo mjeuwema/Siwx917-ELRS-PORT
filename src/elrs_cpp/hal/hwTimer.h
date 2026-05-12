@@ -39,6 +39,14 @@ public:
     static void service();
 
     /**
+     * @brief Timestamp for the timer event currently being serviced.
+     *
+     * Platforms that defer timer callbacks out of ISR context use this to keep
+     * PFD timing anchored to the hardware interrupt rather than task latency.
+     */
+    static uint32_t eventMicros();
+
+    /**
      * @brief Update the timer interval
      * @param newTimerInterval New interval in microseconds
      */
@@ -91,6 +99,18 @@ public:
 
     // ISR handler - exists for API compatibility (actual ISR in hw_timer.c)
     static void IRAM_ATTR handleISR();
+
+    // Diagnostics used while validating the SiW917 HAL against upstream timing.
+    static uint32_t getHardwareHalfTicks();
+    static uint32_t getHardwareCount();
+    static uint32_t getHardwareMatch();
+    static uint32_t getHardwareFreqHz();
+    static uint32_t getQueuedTickCount();
+    static uint32_t getQueuedTockCount();
+    static uint32_t getProcessedTickCount();
+    static uint32_t getProcessedTockCount();
+    static uint32_t getQueueOverflowCount();
+    static uint32_t getImmediateTockDeliveredCount();
 };
 
 // Macro for ISR attribute (platform specific)

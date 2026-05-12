@@ -31,6 +31,8 @@ extern "C" {
 #include "lr1121_elrs_init.h"
 }
 
+#define ELRS_DIAG_GET_PACKET_SOFT_SPI 0
+
 volatile uint32_t isr_1_pending_count = 0;
 volatile uint32_t isr_1_total_count = 0;
 volatile uint32_t isr_2_pending_count = 0;
@@ -291,7 +293,8 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
 
   if (last_command_opcode == LR11XX_RADIO_GET_PACKET) {
     const bool ok = (buffer != nullptr && size > 0) &&
-                    lr1121_elrs_get_packet(buffer, size, true);
+                    lr1121_elrs_get_packet(
+                        buffer, size, ELRS_DIAG_GET_PACKET_SOFT_SPI != 0);
     last_command_opcode = 0;
     if (!ok) {
       DBGLN("ReadCommand GET_PACKET failed size=%u", size);
@@ -337,7 +340,23 @@ bool LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
 // from elrs_loop().
 static volatile bool dio1_isr_pending = false;
 static volatile uint32_t dio1_level_requeue_count = 0;
+static volatile uint32_t dio1_last_edge_us = 0;
+static volatile uint32_t dio1_last_deferred_us = 0;
+
+extern "C" uint32_t lr1121_hal_get_last_dio1_edge_us(void) {
+  return dio1_last_edge_us;
+}
+
+extern "C" uint32_t lr1121_hal_get_last_deferred_us(void) {
+  return dio1_last_deferred_us;
+}
+
+extern "C" bool lr1121_hal_has_pending_dio1(void) {
+  return dio1_isr_pending || (lr1121_dio1_read() != 0);
+}
+
 void LR1121Hal::dioISR_1() {
+  dio1_last_edge_us = micros();
   isr_1_total_count++;
   dio1_isr_pending = true;
   isr_1_pending = true;
@@ -349,11 +368,17 @@ void LR1121Hal::dioISR_1() {
 
 // Called from elrs_loop() to process deferred DIO1 interrupts safely
 void LR1121Hal::handleDeferredISR() {
-  if (!dio1_isr_pending && lr1121_dio1_read() != 0) {
+  const bool dio1High = lr1121_dio1_read() != 0;
+  if (dio1_isr_pending || dio1High) {
+    dio1_last_deferred_us = micros();
+  }
+
+  if (!dio1_isr_pending && dio1High) {
     // DIO1 is level-high until the LR1121 IRQ is cleared. If a new IRQ arrives
     // while the GPIO edge is masked, there may be no fresh rising edge to wake
     // us, so synthesize one from the level.
     dio1_level_requeue_count++;
+    dio1_last_edge_us = dio1_last_deferred_us;
     dio1_isr_pending = true;
     isr_1_pending = true;
     lr1121_dio1_pause_isr();

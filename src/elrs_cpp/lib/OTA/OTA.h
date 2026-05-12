@@ -181,6 +181,7 @@ typedef bool (*ValidatePacketCrc_t)(OTA_Packet_s * const otaPktPtr);
 typedef void (*GeneratePacketCrc_t)(OTA_Packet_s * const otaPktPtr);
 extern ValidatePacketCrc_t OtaValidatePacketCrc;
 extern GeneratePacketCrc_t OtaGeneratePacketCrc;
+bool OtaValidatePacketCrcForNonce(OTA_Packet_s * const otaPktPtr, uint8_t nonce);
 // Value is implicit leading 1, comment is Koopman formatting (implicit trailing 1) https://users.ece.cmu.edu/~koopman/crc/
 #define ELRS_CRC_POLY 0x07 // 0x83
 #define ELRS_CRC14_POLY 0x2E57 // 0x372b

@@ -57,7 +57,7 @@ uint32_t millis(void) {
     return osKernelGetTickCount();
 }
 
-uint32_t micros(void) {
+static uint32_t micros_systick_fallback(void) {
     // Combine the RTOS tick counter with the live SysTick down-counter to
     // preserve sub-millisecond timing. ELRS phase locking depends on this.
     uint32_t tick_before;
@@ -76,6 +76,13 @@ uint32_t micros(void) {
         (uint32_t)(((uint64_t)elapsed_cycles * 1000ULL) / systick_reload);
 
     return (tick_before * 1000U) + sub_ms_us;
+}
+
+uint32_t micros(void) {
+    // Do not use raw 32-bit DWT->CYCCNT here: at 180 MHz it wraps every
+    // ~23.9 seconds. Arduino/ESP32 micros() wraps on the microsecond counter,
+    // and ELRS PFD math relies on that wider time base.
+    return micros_systick_fallback();
 }
 
 void delay(uint32_t ms) {

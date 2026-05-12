@@ -468,26 +468,45 @@ bool ICACHE_RAM_ATTR UnpackChannelData8ch(OTA_Packet_s const * const otaPktPtr, 
 }
 #endif
 
-bool ICACHE_RAM_ATTR ValidatePacketCrcFull(OTA_Packet_s * const otaPktPtr)
+static bool ICACHE_RAM_ATTR ValidatePacketCrcFullWithNonce(
+    OTA_Packet_s * const otaPktPtr, uint16_t const nonceValidator)
 {
-    uint16_t nonceValidator = (otaPktPtr->std.type == PACKET_TYPE_SYNC) ? 0 : OtaNonce;
     uint16_t const calculatedCRC =
         ota_crc.calc((uint8_t*)otaPktPtr, OTA8_CRC_CALC_LEN, OtaCrcInitializer ^ nonceValidator);
     return otaPktPtr->full.crc == calculatedCRC;
 }
 
-bool ICACHE_RAM_ATTR ValidatePacketCrcStd(OTA_Packet_s * const otaPktPtr)
+static bool ICACHE_RAM_ATTR ValidatePacketCrcStdWithNonce(
+    OTA_Packet_s * const otaPktPtr, uint16_t const nonceValidator)
 {
     uint16_t const inCRC = ((uint16_t)otaPktPtr->std.crcHigh << 8) + otaPktPtr->std.crcLow;
 
     // Zero the crcHigh bits, as the CRC is calculated before it is ORed in
     otaPktPtr->std.crcHigh = 0;
 
-    uint16_t nonceValidator = (otaPktPtr->std.type == PACKET_TYPE_SYNC) ? 0 : OtaNonce;
     uint16_t const calculatedCRC =
         ota_crc.calc((uint8_t*)otaPktPtr, OTA4_CRC_CALC_LEN, OtaCrcInitializer ^ nonceValidator);
 
     return inCRC == calculatedCRC;
+}
+
+bool ICACHE_RAM_ATTR ValidatePacketCrcFull(OTA_Packet_s * const otaPktPtr)
+{
+    uint16_t nonceValidator = (otaPktPtr->std.type == PACKET_TYPE_SYNC) ? 0 : OtaNonce;
+    return ValidatePacketCrcFullWithNonce(otaPktPtr, nonceValidator);
+}
+
+bool ICACHE_RAM_ATTR ValidatePacketCrcStd(OTA_Packet_s * const otaPktPtr)
+{
+    uint16_t nonceValidator = (otaPktPtr->std.type == PACKET_TYPE_SYNC) ? 0 : OtaNonce;
+    return ValidatePacketCrcStdWithNonce(otaPktPtr, nonceValidator);
+}
+
+bool ICACHE_RAM_ATTR OtaValidatePacketCrcForNonce(OTA_Packet_s * const otaPktPtr, uint8_t nonce)
+{
+    uint16_t nonceValidator = (otaPktPtr->std.type == PACKET_TYPE_SYNC) ? 0 : nonce;
+    return OtaIsFullRes ? ValidatePacketCrcFullWithNonce(otaPktPtr, nonceValidator)
+                        : ValidatePacketCrcStdWithNonce(otaPktPtr, nonceValidator);
 }
 
 void ICACHE_RAM_ATTR GeneratePacketCrcFull(OTA_Packet_s * const otaPktPtr)

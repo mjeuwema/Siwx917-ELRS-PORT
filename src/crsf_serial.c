@@ -81,21 +81,19 @@ static void usart_callback(uint32_t event)
 
 static int wait_for_tx_idle(void)
 {
-    /* Worst-case CRSF frame time at 420kbaud is well under 1ms. */
-    for (uint32_t spins = 0; spins < 1000000UL; spins++) {
-        ARM_USART_STATUS status = g_usart->GetStatus();
-        if (!g_tx_in_progress && !status.tx_busy) {
-            return 0;
-        }
-    }
+    ARM_USART_STATUS status = g_usart->GetStatus();
 
-    /* Recover if the callback was missed but hardware is idle. */
-    if (!g_usart->GetStatus().tx_busy) {
+    /* Recover if the completion callback lagged but hardware is already idle. */
+    if (!status.tx_busy) {
         g_tx_in_progress = false;
-        return 0;
     }
 
-    return -1;
+    /*
+     * Do not spin here. ELRS RX timing is more important than a CRSF output
+     * frame, and a busy-wait in the FreeRTOS task can starve hwTimer::service()
+     * long enough to drop Tick/Tock events.
+     */
+    return (!g_tx_in_progress && !status.tx_busy) ? 0 : -1;
 }
 
 static int transmit_frame(const uint8_t *frame, uint32_t frame_len)

@@ -8,7 +8,7 @@
  *
  * The CT provides:
  * - SOC_PLL clock (180MHz, crystal accuracy) - ~5.5ns resolution
- * - 32-bit mode for long intervals
+ * - 16-bit Counter 0 mode for ELRS half-intervals
  * - Buffer register for glitch-free interval updates
  *
  * Citation: ExpressLRS 4.0 lib/HWTIMER/hwTimer.h - Class interface
@@ -34,22 +34,95 @@ volatile uint32_t hwTimer::HWtimerInterval = 20000; // Default 20ms (50Hz)
 volatile int32_t hwTimer::PhaseShift = 0;
 volatile int32_t hwTimer::FreqOffset = 0;
 
+static volatile bool immediateTockPending = false;
+static volatile uint32_t activeEventMicros = 0;
+
+enum TimerEventType : uint8_t {
+  TIMER_EVENT_TICK = 1,
+  TIMER_EVENT_TOCK = 2,
+};
+
+struct TimerEvent {
+  uint8_t type;
+  uint32_t timestampUs;
+};
+
+static constexpr uint16_t TIMER_EVENT_QUEUE_SIZE = 128;
+static TimerEvent timerEventQueue[TIMER_EVENT_QUEUE_SIZE] = {};
+static volatile uint16_t timerEventHead = 0;
+static volatile uint16_t timerEventTail = 0;
+static volatile uint32_t timerEventOverflowCount = 0;
+static volatile uint32_t queuedTickCount = 0;
+static volatile uint32_t queuedTockCount = 0;
+static volatile uint32_t processedTickCount = 0;
+static volatile uint32_t processedTockCount = 0;
+static volatile uint32_t immediateTockDeliveredCount = 0;
+
+static void resetTimerEventQueue() {
+  immediateTockPending = false;
+  timerEventHead = 0;
+  timerEventTail = 0;
+}
+
+static void resetTimerEventStats() {
+  timerEventOverflowCount = 0;
+  queuedTickCount = 0;
+  queuedTockCount = 0;
+  processedTickCount = 0;
+  processedTockCount = 0;
+  immediateTockDeliveredCount = 0;
+}
+
+static void enqueueTimerEvent(uint8_t type) {
+  const uint16_t head = timerEventHead;
+  const uint16_t nextHead =
+      (uint16_t)((head + 1U) % TIMER_EVENT_QUEUE_SIZE);
+
+  if (nextHead == timerEventTail) {
+    // Single-producer/single-consumer queue: the ISR owns head only, while the
+    // task owns tail. Dropping the newest event is safer than moving tail here.
+    timerEventOverflowCount++;
+    return;
+  }
+
+  timerEventQueue[head].type = type;
+  timerEventQueue[head].timestampUs = micros();
+  timerEventHead = nextHead;
+
+  if (type == TIMER_EVENT_TICK) {
+    queuedTickCount++;
+  } else if (type == TIMER_EVENT_TOCK) {
+    queuedTockCount++;
+  }
+}
+
+static bool dequeueTimerEvent(TimerEvent *event) {
+  if (timerEventTail == timerEventHead) {
+    return false;
+  }
+
+  *event = timerEventQueue[timerEventTail];
+  timerEventTail =
+      (uint16_t)((timerEventTail + 1U) % TIMER_EVENT_QUEUE_SIZE);
+  return true;
+}
+
 //-----------------------------------------------------------------------------
 // Internal C callback bridge
 //-----------------------------------------------------------------------------
 
-// These functions are called by hw_timer.c ISR and bridge to our C++ callbacks
+// These functions are called by hw_timer.c ISR. Queue the work so ELRS core
+// callbacks can do LR1121 SPI from task context instead of timer interrupt
+// context; the queued timestamp preserves PFD timing.
 static void hwTimerTickBridge(void) {
-  hwTimer::isTick = true;
-  if (hwTimer::running && hwTimer::callbackTick) {
-    hwTimer::callbackTick();
+  if (hwTimer::running) {
+    enqueueTimerEvent(TIMER_EVENT_TICK);
   }
 }
 
 static void hwTimerTockBridge(void) {
-  hwTimer::isTick = false;
-  if (hwTimer::running && hwTimer::callbackTock) {
-    hwTimer::callbackTock();
+  if (hwTimer::running) {
+    enqueueTimerEvent(TIMER_EVENT_TOCK);
   }
 }
 
@@ -67,6 +140,9 @@ void hwTimer::init(hwTimerCallback_t cbTick, hwTimerCallback_t cbTock) {
   isTick = false;
   PhaseShift = 0;
   FreqOffset = 0;
+  activeEventMicros = 0;
+  resetTimerEventQueue();
+  resetTimerEventStats();
 
   // Bypass removed - hwTimer now enabled
 
@@ -96,6 +172,7 @@ void hwTimer::stop() {
     return;
 
   running = false;
+  resetTimerEventQueue();
   hw_timer_stop();
   DBGLN("hwTimer stopped");
 }
@@ -104,11 +181,13 @@ void hwTimer::resume() {
   if (running)
     return;
 
-  // Match upstream RX behavior: the first TOCK happens as soon as the current
-  // radio callback has recorded its packet reference, then hardware continues
-  // with the following TICK.
+  // Match upstream RX behavior: enabling the timer schedules an immediate TOCK,
+  // but that TOCK does not interrupt the currently running radio callback.
   isTick = false;
   PhaseShift = 0;
+  activeEventMicros = 0;
+  resetTimerEventQueue();
+  resetTimerEventStats();
 
   sl_status_t status = hw_timer_start();
   if (status != SL_STATUS_OK) {
@@ -120,18 +199,56 @@ void hwTimer::resume() {
   running = true;
   isTick = false;
   hw_timer_note_immediate_tock();
+  immediateTockPending = true;
 
   DBGLN("hwTimer resumed, interval=%lu us", HWtimerInterval);
-
-  if (callbackTock) {
-    callbackTock();
-  }
-
-  isTick = true;
 }
 
 void hwTimer::service() {
-  // Kept for compatibility with the ELRS task loop.
+  if (!running) {
+    return;
+  }
+
+  if (immediateTockPending) {
+    immediateTockPending = false;
+    isTick = false;
+    activeEventMicros = micros();
+    immediateTockDeliveredCount++;
+    processedTockCount++;
+
+    if (callbackTock) {
+      callbackTock();
+    }
+
+    activeEventMicros = 0;
+    isTick = true;
+  }
+
+  TimerEvent event;
+  while (running && dequeueTimerEvent(&event)) {
+    activeEventMicros = event.timestampUs;
+    if (event.type == TIMER_EVENT_TICK) {
+      isTick = true;
+      processedTickCount++;
+      if (callbackTick) {
+        callbackTick();
+      }
+      isTick = false;
+    } else if (event.type == TIMER_EVENT_TOCK) {
+      isTick = false;
+      processedTockCount++;
+      if (callbackTock) {
+        callbackTock();
+      }
+      isTick = true;
+    }
+    activeEventMicros = 0;
+  }
+}
+
+uint32_t hwTimer::eventMicros() {
+  const uint32_t eventTime = activeEventMicros;
+  return eventTime != 0 ? eventTime : micros();
 }
 
 void hwTimer::updateInterval(uint32_t newTimerInterval) {
@@ -149,7 +266,7 @@ void hwTimer::resetFreqOffset() {
 }
 
 void hwTimer::phaseShift(int32_t newPhaseShift) {
-  // Clamp to reasonable range (±1/4 of interval)
+  // Clamp to reasonable range (+/- 1/4 of interval)
   int32_t maxShift = (int32_t)(HWtimerInterval >> 2);
   if (newPhaseShift > maxShift)
     newPhaseShift = maxShift;
@@ -177,4 +294,30 @@ void hwTimer::decFreqOffset() {
 void hwTimer::handleISR() {
   // ISR handling is done by hw_timer.c callback mechanism
   // This function exists for API compatibility but is unused
+}
+
+uint32_t hwTimer::getHardwareHalfTicks() {
+  return hw_timer_get_total_half_ticks();
+}
+
+uint32_t hwTimer::getHardwareCount() { return hw_timer_get_current_count(); }
+
+uint32_t hwTimer::getHardwareMatch() { return hw_timer_get_match_value(); }
+
+uint32_t hwTimer::getHardwareFreqHz() { return hw_timer_get_ct_freq_hz(); }
+
+uint32_t hwTimer::getQueuedTickCount() { return queuedTickCount; }
+
+uint32_t hwTimer::getQueuedTockCount() { return queuedTockCount; }
+
+uint32_t hwTimer::getProcessedTickCount() { return processedTickCount; }
+
+uint32_t hwTimer::getProcessedTockCount() { return processedTockCount; }
+
+uint32_t hwTimer::getQueueOverflowCount() {
+  return timerEventOverflowCount;
+}
+
+uint32_t hwTimer::getImmediateTockDeliveredCount() {
+  return immediateTockDeliveredCount;
 }

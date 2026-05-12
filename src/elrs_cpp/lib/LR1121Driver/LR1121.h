@@ -82,6 +82,7 @@ private:
 
   // LR1121_RadioOperatingModes_t currOpmode;
   bool useFSK;
+  bool rxContinuousActive;
   bool modeSupportsFei;
   uint8_t pwrCurrentLF;
   uint8_t pwrPendingLF;

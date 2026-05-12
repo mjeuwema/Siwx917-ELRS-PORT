@@ -25,7 +25,11 @@
 //  <e>Config Timer UC Configuration
 //  <i> Enable: Use configuration from this file
 //  <i> Default: 1
-#define CONFIG_TIMER_UC 1
+//
+// ELRS configures this timer at runtime because the packet interval changes
+// with the selected RF rate. Leave UC disabled so the SDK honors the
+// sl_si91x_config_timer_set_configuration() argument from hw_timer.c.
+#define CONFIG_TIMER_UC 0
 
 // Counter-0 Direction: Up Counter for ELRS timing
 // We count up from 0 to match value, then interrupt fires

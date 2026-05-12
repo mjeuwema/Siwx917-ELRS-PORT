@@ -45,19 +45,28 @@ extern "C" {
 #include "wifi_http_test.h"
 void elrs_cpp_request_wifi_mode(void);
 int lr1121_dio1_read(void);
+uint32_t lr1121_hal_get_last_dio1_edge_us(void);
+uint32_t lr1121_hal_get_last_deferred_us(void);
+uint32_t lr1121_get_last_rxnbisr_entry_us(void);
+uint32_t lr1121_get_last_packet_ready_us(void);
 void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
                           uint32_t *tx_count, uint32_t *other_count,
                           uint32_t *last_irq);
+bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status);
 }
 
 //// CONSTANTS ////
 #define SEND_LINK_STATS_TO_FC_INTERVAL 100
-#define PACKET_TO_TOCK_SLACK                                                   \
-  200 // Desired buffer time between Packet ISR and Tock ISR
+// Desired buffer time between Packet ISR and Tock ISR. Keep this aligned with
+// upstream ELRS; platform latency belongs in the HAL/timer adapter, not here.
+#define PACKET_TO_TOCK_SLACK 200
 #define CRSF_RC_OUTPUT_INTERVAL 4 // Output RC channels every 4ms (~250Hz)
 #define RFmodeCycleMultiplierSlow 10
 #define BindingRateChangeCyclePeriodMs 125U
 #define ELRS_DIAG_DISABLE_DOWNLINK_TLM 0
+#define ELRS_DIAG_DISABLE_CRSF_SERIAL 1
+#define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 0
+#define ELRS_DIAG_CRC_NONCE_WINDOW 0
 ///////////////////
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
@@ -263,6 +272,14 @@ uint32_t uidMacSeedGet() {
 static bool use2G4Domain(void) { return firmwareOptions.domain >= 8; }
 
 static uint8_t getStartupOrBindingRateIndex(void) {
+  if (!InBindingMode) {
+    elrs_config_t *cfg = elrs_config_get();
+    if (cfg != nullptr && cfg->rate_index < RATE_MAX &&
+        isSupportedRFRate(cfg->rate_index)) {
+      return cfg->rate_index;
+    }
+  }
+
   return enumRatetoIndex(use2G4Domain() ? RATE_LORA_2G4_50HZ : RATE_BINDING);
 }
 
@@ -376,10 +393,9 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
     return;
   }
 
-  // On SiW917/LR1121, separate SetRfFrequency + SetRx leaves a timing gap on
-  // every FHSS hop. Use the LR1121 fused helper so the radio re-enters RX in
-  // the same command boundary.
-  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, true);
+  // Match upstream RX core: platform-specific fused retune/RX handling belongs
+  // behind the LR1121 HAL boundary.
+  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, false);
 }
 
 static void ICACHE_RAM_ATTR HWtimerCallbackTick() {
@@ -392,7 +408,7 @@ static void ICACHE_RAM_ATTR HWtimerCallbackTick() {
 }
 
 static void ICACHE_RAM_ATTR HWtimerCallbackTock() {
-  PFDloop.intEvent(micros());
+  PFDloop.intEvent(hwTimer::eventMicros());
   OtaNonce++;
   HandleFHSS();
   if (HandleSendDataDl()) {
@@ -612,6 +628,66 @@ static volatile uint8_t lastValidExpectedFhss = 0;
 static volatile uint8_t lastValidSyncNonce = 0xFF;
 static volatile uint8_t lastValidSyncFhss = 0xFF;
 static volatile uint32_t lastValidFreq = 0;
+static volatile uint32_t lastRxDoneLatencyUs = 0;
+static volatile uint32_t lastDioToDeferredUs = 0;
+static volatile uint32_t lastDeferredToRxIsrUs = 0;
+static volatile uint32_t lastRxIsrToPacketUs = 0;
+static volatile uint32_t lastPacketToCallbackUs = 0;
+static volatile int32_t lastPfdSlackUs = PACKET_TO_TOCK_SLACK;
+static volatile uint8_t lastPfdUsedEdgeTimestamp = 0;
+static volatile uint8_t lastRadioStat1 = 0;
+static volatile uint8_t lastRadioStat2 = 0;
+static volatile uint8_t lastRadioIrqByte = 0;
+static volatile uint8_t lastRadioStatusOk = 0;
+static volatile uint32_t pfdSkippedNoTimestampCount = 0;
+static volatile int8_t lastCrcNonceDelta = 127;
+static volatile uint8_t lastCrcNonceType = 0xFF;
+static volatile uint8_t lastCrcNonceExpected = 0;
+static volatile uint8_t lastCrcNonceMatched = 0xFF;
+static volatile uint32_t crcNonceDiagHitCount = 0;
+static volatile uint32_t crcNonceDiagMissCount = 0;
+
+static inline int32_t ICACHE_RAM_ATTR absI32(int32_t value) {
+  return value < 0 ? -value : value;
+}
+
+static inline int32_t ICACHE_RAM_ATTR maxI32(int32_t lhs, int32_t rhs) {
+  return lhs > rhs ? lhs : rhs;
+}
+
+static void ICACHE_RAM_ATTR
+diagnoseCrcFailureNonce(OTA_Packet_s const *const otaPktPtr,
+                        uint8_t const type) {
+#if ELRS_DIAG_CRC_NONCE_WINDOW > 0
+  if (type == PACKET_TYPE_SYNC) {
+    return;
+  }
+
+  const uint8_t expectedNonce = OtaNonce;
+  lastCrcNonceType = type;
+  lastCrcNonceExpected = expectedNonce;
+
+  for (int8_t delta = -ELRS_DIAG_CRC_NONCE_WINDOW;
+       delta <= ELRS_DIAG_CRC_NONCE_WINDOW; delta++) {
+    OTA_Packet_s packetCopy;
+    memcpy(&packetCopy, otaPktPtr, sizeof(packetCopy));
+    const uint8_t candidateNonce = (uint8_t)(expectedNonce + delta);
+    if (OtaValidatePacketCrcForNonce(&packetCopy, candidateNonce)) {
+      lastCrcNonceDelta = delta;
+      lastCrcNonceMatched = candidateNonce;
+      crcNonceDiagHitCount++;
+      return;
+    }
+  }
+
+  lastCrcNonceDelta = 127;
+  lastCrcNonceMatched = 0xFF;
+  crcNonceDiagMissCount++;
+#else
+  (void)otaPktPtr;
+  (void)type;
+#endif
+}
 
 static bool ICACHE_RAM_ATTR
 ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
@@ -620,6 +696,47 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   }
 
   uint32_t const beginProcessing = micros();
+  uint32_t const dio1EdgeUs = lr1121_hal_get_last_dio1_edge_us();
+  uint32_t const deferredUs = lr1121_hal_get_last_deferred_us();
+  uint32_t const rxIsrEntryUs = lr1121_get_last_rxnbisr_entry_us();
+  uint32_t const packetReadyUs = lr1121_get_last_packet_ready_us();
+  const bool timerRunningForPfd = hwTimer::isRunning();
+  uint32_t packetTimeUs = beginProcessing;
+  uint8_t pfdSourceForPacket = 0;
+  if (dio1EdgeUs != 0U) {
+    const uint32_t irqLatencyUs = beginProcessing - dio1EdgeUs;
+    if (irqLatencyUs < 10000U) {
+      lastRxDoneLatencyUs = irqLatencyUs;
+#if ELRS_DIAG_USE_DIO_PFD_TIMESTAMP
+      packetTimeUs = dio1EdgeUs;
+      if (timerRunningForPfd) {
+        pfdSourceForPacket = 1;
+      }
+#endif
+    }
+    const uint32_t dioToDeferred = deferredUs - dio1EdgeUs;
+    if (deferredUs != 0U && dioToDeferred < 10000U) {
+      lastDioToDeferredUs = dioToDeferred;
+    }
+  }
+  if (deferredUs != 0U && rxIsrEntryUs != 0U) {
+    const uint32_t deferredToRxIsr = rxIsrEntryUs - deferredUs;
+    if (deferredToRxIsr < 10000U) {
+      lastDeferredToRxIsrUs = deferredToRxIsr;
+    }
+  }
+  if (rxIsrEntryUs != 0U && packetReadyUs != 0U) {
+    const uint32_t rxIsrToPacket = packetReadyUs - rxIsrEntryUs;
+    if (rxIsrToPacket < 10000U) {
+      lastRxIsrToPacketUs = rxIsrToPacket;
+    }
+  }
+  if (packetReadyUs != 0U) {
+    const uint32_t packetToCallback = beginProcessing - packetReadyUs;
+    if (packetToCallback < 10000U) {
+      lastPacketToCallbackUs = packetToCallback;
+    }
+  }
   uint32_t const now = millis();
 
   OTA_Packet_s *const otaPktPtr = (OTA_Packet_s *const)Radio.RXdataBuffer;
@@ -629,6 +746,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   if (!OtaValidatePacketCrc(otaPktPtr)) {
     crcFailCount++;
     crcFailTypeCount[type]++;
+    diagnoseCrcFailureNonce(otaPktPtr, type);
     return false;
   }
 
@@ -638,17 +756,16 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   lastValidExpectedNonce = OtaNonce;
   lastValidExpectedFhss = FHSSgetCurrIndex();
   lastValidFreq = Radio.currFreq;
+  lastPfdUsedEdgeTimestamp = pfdSourceForPacket;
 
   if (ExpressLRS_currAirRate_Modparams != nullptr &&
       ExpressLRS_currAirRate_RFperfParams != nullptr) {
-    int32_t slack = PACKET_TO_TOCK_SLACK;
-    int32_t toaSlack =
+    const int32_t slack = maxI32(
         (int32_t)ExpressLRS_currAirRate_Modparams->interval -
-        (2 * (int32_t)ExpressLRS_currAirRate_RFperfParams->TOA);
-    if (toaSlack > slack) {
-      slack = toaSlack;
-    }
-    PFDloop.extEvent(beginProcessing + slack);
+            2 * (int32_t)ExpressLRS_currAirRate_RFperfParams->TOA,
+        (int32_t)PACKET_TO_TOCK_SLACK);
+    lastPfdSlackUs = slack;
+    PFDloop.extEvent(packetTimeUs + slack);
   }
 
   // Capture this packet
@@ -657,12 +774,6 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   pkt_capture_len[cidx] = 8;
   pkt_capture_idx++;
   pkt_capture_count++;
-
-  // Update link quality and RSSI
-  LQCalc.add();
-  Radio.GetLastPacketStats();
-  getRFlinkInfo();
-  RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
 
   // Record valid packet time
   LastValidPacket = now;
@@ -689,6 +800,13 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
     break;
   }
 
+  // Match downstream RX core ordering: packet contents are handled before the
+  // current LQ period is marked as consumed.
+  Radio.GetLastPacketStats();
+  getRFlinkInfo();
+  LQCalc.add();
+  RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
+
   return true;
 }
 
@@ -701,7 +819,7 @@ static bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
   }
 
   if (ProcessRFPacket(rxStatus)) {
-    if (doStartTimer && !hwTimer::isRunning()) {
+    if (doStartTimer) {
       doStartTimer = false;
       hwTimer::resume();
     }
@@ -720,6 +838,8 @@ static void ICACHE_RAM_ATTR TXdoneISR() {
 // RF Link rate setting
 //=============================================================================
 static void SetRFLinkRate(uint8_t index, bool bindMode) {
+  DBGLN("SetRFLinkRate begin: index=%d bind=%d", index, bindMode ? 1 : 0);
+
   expresslrs_mod_settings_s *const ModParams = get_elrs_airRateConfig(index);
   expresslrs_rf_pref_params_s *const RFperf = get_elrs_RFperfParams(index);
 
@@ -733,6 +853,8 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
 
   uint32_t interval = ModParams->interval;
   hwTimer::updateInterval(interval);
+  DBGLN("SetRFLinkRate timer updated: interval=%lu",
+        (unsigned long)interval);
 
   // Configure FHSS band selection
   FHSSusePrimaryFreqBand =
@@ -751,9 +873,13 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
                ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_900 ||
                    ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_2G4,
                (uint8_t)UID[5], (uint8_t)UID[4]);
+  DBGLN("SetRFLinkRate radio configured");
 
   // Update OTA serializers
   OtaUpdateSerializers(smWideOr8ch, ModParams->PayloadLength);
+  DataUlReceiver.setMaxPackageIndex(ELRS_MSP_MAX_PACKAGES);
+  TelemetrySender.setMaxPackageIndex(OtaIsFullRes ? ELRS8_DATA_DL_MAX_PACKAGES
+                                                  : ELRS4_DATA_DL_MAX_PACKAGES);
 
   // Calculate cycle interval for rate scanning
   cycleInterval = ((uint32_t)11U * FHSSgetChannelCount() *
@@ -908,17 +1034,24 @@ static void cycleRfMode() {
 
   if ((now - RFmodeLastCycled) > (cycleInterval * RFmodeCycleMultiplier)) {
     RFmodeLastCycled = now;
+    LastSyncPacket = now;
 
-    // Find next valid rate
+    const uint8_t currentScanIndex = scanIndex % RATE_MAX;
+    DBGLN("cycleRfMode begin: scan=%u interval=%lu multiplier=%u",
+          currentScanIndex, (unsigned long)cycleInterval,
+          (unsigned)RFmodeCycleMultiplier);
+    SetRFLinkRate(currentScanIndex, false);
+    LQCalc.reset100();
+
     do {
       scanIndex = (scanIndex + 1) % RATE_MAX;
     } while (!isSupportedRFRate(scanIndex));
 
-    SetRFLinkRate(scanIndex, InBindingMode);
     Radio.RXnb();
+    DBGLN("cycleRfMode RX re-armed");
     RFmodeCycleMultiplier = 1;
 
-    DBGLN("Cycling to rate index %d", scanIndex);
+    DBGLN("Cycling to rate index %d", currentScanIndex);
 
     // Enable per-iteration diagnostics in elrs_loop to catch hang
     rateCyclingStarted = true;
@@ -1067,9 +1200,10 @@ bool elrs_init(void) {
 
   hwTimer::init(HWtimerCallbackTick, HWtimerCallbackTock);
 
-  // Start on the slowest rate in the selected band for reliable acquisition.
+  // Start on the configured rate, matching upstream's scan-start behavior.
   scanIndex = getStartupOrBindingRateIndex();
   SetRFLinkRate(scanIndex, false);
+  RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow / 2;
 
   // Start receiving
   Radio.RXnb();
@@ -1078,6 +1212,9 @@ bool elrs_init(void) {
   // Record start time for rate cycling
   RFmodeLastCycled = millis();
 
+#if ELRS_DIAG_DISABLE_CRSF_SERIAL
+  DBGLN("CRSF serial output disabled for standalone RF timing test");
+#else
   // Initialize CRSF serial output to flight controller
   // Uses USART0 at 420000 baud (ELRS standard)
   if (crsf_serial_init(420000) != 0) {
@@ -1085,6 +1222,7 @@ bool elrs_init(void) {
   } else {
     DBGLN("CRSF serial output initialized");
   }
+#endif
 
   // Load model match ID from config (0xFF = disabled)
   elrs_config_t *cfg = elrs_config_get();
@@ -1102,6 +1240,7 @@ void elrs_loop(void) {
   // CRITICAL: Process deferred DIO1 interrupts in main-loop context.
   // The ISR only sets a flag (no SPI). We process it here where SPI is safe.
   LR1121Hal::handleDeferredISR();
+  hwTimer::service();
 
   unsigned long now = millis();
 
@@ -1121,34 +1260,98 @@ void elrs_loop(void) {
     uint32_t lastIrq = 0;
     lr1121_get_isr_stats(&isrCount, &rxIrqCount, &txIrqCount, &otherIrqCount,
                          &lastIrq);
-    DBGLN("ISR:%lu RXirq:%lu TXirq:%lu other:%lu RXok:%lu CRCfail:%lu "
-          "conn:%d rxst:%d rate:%d "
-          "freq:%lu DIO1:%d IRQ:0x%08lX age:%lu nonce:%u fhss:%u pfd:%ld/%ld/"
-          "%ld ph:%ld fo:%ld lq:%u/%u rssi:%d snr:%d tlm:%lu/%lu den:%u "
-          "okT:%lu/%lu/%lu failT:%lu/%lu/%lu last:%u exp:%u/%u sync:%u/%u "
-          "vf:%lu disc:%u",
-          isrCount, rxIrqCount, txIrqCount, otherIrqCount, pkt_capture_count,
-          crcFailCount, connectionState, RXtimerState,
-          ExpressLRS_currAirRate_Modparams
-              ? ExpressLRS_currAirRate_Modparams->index
-              : 0,
-          Radio.currFreq, lr1121_dio1_read(), lastIrq,
-          (unsigned long)(now - LastValidPacket), OtaNonce, FHSSgetCurrIndex(),
-          (long)pfdLastRawOffset, (long)pfdLastOffset,
-          (long)pfdLastOffsetDx, (long)pfdLastPhaseShift,
-          (long)hwTimer::FreqOffset, LQCalc.getLQRaw(), LQCalc.getCount(),
-          Radio.LastPacketRSSI, Radio.LastPacketSNRRaw,
-          (unsigned long)telemetryTxCount,
-          (unsigned long)telemetrySuppressedCount, ExpressLRS_currTlmDenom,
+    if (isrCount == 0 && connectionState == disconnected) {
+      uint8_t stat1 = 0;
+      uint8_t stat2 = 0;
+      uint8_t irq = 0;
+      lastRadioStatusOk = lr1121_get_status(&stat1, &stat2, &irq) ? 1 : 0;
+      lastRadioStat1 = stat1;
+      lastRadioStat2 = stat2;
+      lastRadioIrqByte = irq;
+    }
+    DBGLN("IRQ isr:%lu rx:%lu tx:%lu other:%lu dio:%d irq:0x%08lX "
+          "rxok:%lu crcfail:%lu okT:%lu/%lu/%lu failT:%lu/%lu/%lu "
+          "stat:%u/%02X/%02X/%02X",
+          isrCount, rxIrqCount, txIrqCount, otherIrqCount, lr1121_dio1_read(),
+          lastIrq, pkt_capture_count, crcFailCount,
           (unsigned long)crcPassTypeCount[PACKET_TYPE_RCDATA],
           (unsigned long)crcPassTypeCount[PACKET_TYPE_DATA],
           (unsigned long)crcPassTypeCount[PACKET_TYPE_SYNC],
           (unsigned long)crcFailTypeCount[PACKET_TYPE_RCDATA],
           (unsigned long)crcFailTypeCount[PACKET_TYPE_DATA],
           (unsigned long)crcFailTypeCount[PACKET_TYPE_SYNC],
-          lastValidPacketType, lastValidExpectedNonce, lastValidExpectedFhss,
-          lastValidSyncNonce, lastValidSyncFhss, (unsigned long)lastValidFreq,
+          lastRadioStatusOk, lastRadioStat1, lastRadioStat2, lastRadioIrqByte);
+    hwTimer::service();
+    DBGLN("LINK conn:%d rxst:%d rate:%d freq:%lu age:%lu nonce:%u fhss:%u "
+          "pfd:%ld/%ld/%ld ph:%ld fo:%ld lq:%u/%u rssi:%d snr:%d disc:%u",
+          connectionState, RXtimerState,
+          ExpressLRS_currAirRate_Modparams
+              ? ExpressLRS_currAirRate_Modparams->index
+              : 0,
+          Radio.currFreq, (unsigned long)(now - LastValidPacket), OtaNonce,
+          FHSSgetCurrIndex(),
+          (long)pfdLastRawOffset, (long)pfdLastOffset,
+          (long)pfdLastOffsetDx, (long)pfdLastPhaseShift,
+          (long)hwTimer::FreqOffset, LQCalc.getLQRaw(), LQCalc.getCount(),
+          Radio.LastPacketRSSI, Radio.LastPacketSNRRaw,
           (unsigned)lastDisconnectReason);
+    hwTimer::service();
+#if ELRS_DIAG_CRC_NONCE_WINDOW > 0
+    DBGLN("TIM lat:%lu e2loop:%lu loop2rx:%lu rx2pkt:%lu pkt2cb:%lu "
+          "slack:%ld pfdsrc:%u pfdskip:%lu last:%u exp:%u/%u sync:%u/%u "
+          "vf:%lu crcN:%d/%u/%u/%lu/%lu tlm:%lu/%lu den:%u "
+          "tmr:%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu",
+          (unsigned long)lastRxDoneLatencyUs,
+          (unsigned long)lastDioToDeferredUs,
+          (unsigned long)lastDeferredToRxIsrUs,
+          (unsigned long)lastRxIsrToPacketUs,
+          (unsigned long)lastPacketToCallbackUs, (long)lastPfdSlackUs,
+          lastPfdUsedEdgeTimestamp,
+          (unsigned long)pfdSkippedNoTimestampCount, lastValidPacketType,
+          lastValidExpectedNonce, lastValidExpectedFhss, lastValidSyncNonce,
+          lastValidSyncFhss, (unsigned long)lastValidFreq,
+          (int)lastCrcNonceDelta, lastCrcNonceExpected,
+          lastCrcNonceMatched, (unsigned long)crcNonceDiagHitCount,
+          (unsigned long)crcNonceDiagMissCount,
+          (unsigned long)telemetryTxCount,
+          (unsigned long)telemetrySuppressedCount, ExpressLRS_currTlmDenom,
+          (unsigned long)hwTimer::getHardwareHalfTicks(),
+          (unsigned long)hwTimer::getHardwareCount(),
+          (unsigned long)hwTimer::getHardwareMatch(),
+          (unsigned long)hwTimer::getHardwareFreqHz(),
+          (unsigned long)hwTimer::getQueuedTickCount(),
+          (unsigned long)hwTimer::getQueuedTockCount(),
+          (unsigned long)hwTimer::getProcessedTickCount(),
+          (unsigned long)hwTimer::getProcessedTockCount(),
+          (unsigned long)hwTimer::getQueueOverflowCount(),
+          (unsigned long)hwTimer::getImmediateTockDeliveredCount());
+#else
+    DBGLN("TIM lat:%lu e2loop:%lu loop2rx:%lu rx2pkt:%lu pkt2cb:%lu "
+          "slack:%ld pfdsrc:%u pfdskip:%lu last:%u exp:%u/%u sync:%u/%u "
+          "vf:%lu tlm:%lu/%lu den:%u "
+          "tmr:%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu",
+          (unsigned long)lastRxDoneLatencyUs,
+          (unsigned long)lastDioToDeferredUs,
+          (unsigned long)lastDeferredToRxIsrUs,
+          (unsigned long)lastRxIsrToPacketUs,
+          (unsigned long)lastPacketToCallbackUs, (long)lastPfdSlackUs,
+          lastPfdUsedEdgeTimestamp,
+          (unsigned long)pfdSkippedNoTimestampCount, lastValidPacketType,
+          lastValidExpectedNonce, lastValidExpectedFhss, lastValidSyncNonce,
+          lastValidSyncFhss, (unsigned long)lastValidFreq,
+          (unsigned long)telemetryTxCount,
+          (unsigned long)telemetrySuppressedCount, ExpressLRS_currTlmDenom,
+          (unsigned long)hwTimer::getHardwareHalfTicks(),
+          (unsigned long)hwTimer::getHardwareCount(),
+          (unsigned long)hwTimer::getHardwareMatch(),
+          (unsigned long)hwTimer::getHardwareFreqHz(),
+          (unsigned long)hwTimer::getQueuedTickCount(),
+          (unsigned long)hwTimer::getQueuedTockCount(),
+          (unsigned long)hwTimer::getProcessedTickCount(),
+          (unsigned long)hwTimer::getProcessedTockCount(),
+          (unsigned long)hwTimer::getQueueOverflowCount(),
+          (unsigned long)hwTimer::getImmediateTockDeliveredCount());
+#endif
   }
 
   updateTelemetryBurst();
@@ -1177,6 +1380,8 @@ void elrs_loop(void) {
        ExpressLRS_currAirRate_RFperfParams->RxLockTimeoutMs)) {
     lastDisconnectReason = DISC_RX_LOCK_TIMEOUT;
     LostConnection(true);
+    RFmodeLastCycled = now;
+    LastSyncPacket = now;
   }
 
   // Connection timeout check
@@ -1194,30 +1399,20 @@ void elrs_loop(void) {
       (ExpressLRS_nextAirRateIndex != ExpressLRS_currAirRate_Modparams->index)) {
     lastDisconnectReason = DISC_RATE_CHANGE;
     LostConnection(true);
+    LastSyncPacket = now;
+    RFmodeLastCycled = now;
   }
 
   if (connectionState == tentative) {
-    const bool lqLooksReal = LQCalc.getLQRaw() > minLqForChaos();
-    const bool pfdLooksStable = (LPF_OffsetDx.value() <= 10) &&
-                                (LPF_OffsetDx.value() >= -10) &&
-                                (LPF_Offset.value() < 100);
-    const uint32_t freshPacketWindow =
-        (ExpressLRS_currAirRate_Modparams->interval / 1000U) * 3U;
-    const bool crcLocked =
-        lqLooksReal && LastValidPacket != 0 &&
-        ((now - LastValidPacket) <= freshPacketWindow);
-
-    // SiW917 has noticeably noisier PFD measurements while SPI and the CT
-    // timer are both active. CRC-valid bound packets are a stronger signal
-    // than the early PFD derivative, so do not strand the RX in tentative.
-    if (lqLooksReal && (pfdLooksStable || crcLocked)) {
+    if ((absI32(LPF_OffsetDx.value()) <= 10) && (LPF_Offset.value() < 100) &&
+        (LQCalc.getLQRaw() > minLqForChaos())) {
       GotConnection(now);
     }
   }
 
   if ((RXtimerState == tim_tentative) &&
       ((now - GotConnectionMillis) > ConsiderConnGoodMillis) &&
-      (LPF_OffsetDx.value() <= 5) && (LPF_OffsetDx.value() >= -5)) {
+      (absI32(LPF_OffsetDx.value()) <= 5)) {
     RXtimerState = tim_locked;
   }
 
@@ -1315,6 +1510,7 @@ void elrs_loop(void) {
   // DBGLN calls printf which uses UART interrupts/DMA. That was taking too
   // long and starving the GSPI DMA completion callback when hwTimer frequency
   // hopped!
+  hwTimer::service();
 }
 
 elrs_connection_state_t elrs_get_connection_state(void) {

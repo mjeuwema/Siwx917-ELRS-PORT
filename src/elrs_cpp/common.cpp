@@ -113,7 +113,9 @@ uint8_t ICACHE_RAM_ATTR enumRatetoIndex(expresslrs_RFrates_e const eRate)
             return i;
         }
     }
-    return 0;  // Not found, return first rate
+    // Match upstream fallback behavior: if a slow 25 Hz enum is unavailable,
+    // prefer the slowest supported table entry; otherwise fall back to fastest.
+    return (eRate == RATE_LORA_900_25HZ) ? RATE_MAX - 1 : 0;
 }
 
 uint8_t ICACHE_RAM_ATTR TLMratioEnumToValue(expresslrs_tlm_ratio_e const enumval)

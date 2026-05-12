@@ -58,7 +58,10 @@
  */
 // #define USE_SOFT_SPI
 
-#define LR1121_GSPI_BITRATE_HZ 2000000U
+/* Downstream ELRS ESP32 drives LR1121 SPI at 16 MHz. Keep the SiW917 GSPI
+ * hot path aligned so packet reads and FHSS retunes fit the RX timing budget.
+ */
+#define LR1121_GSPI_BITRATE_HZ 16000000U
 
 /*
  * Slower edge timing for SiW917 GPIO-driven SPI fallback paths. The hardware
@@ -66,11 +69,18 @@
  * conservative to make logic-analyzer captures cleaner.
  */
 #define LR1121_SOFT_SPI_EDGE_DELAY_LOOPS 48
+#define LR1121_DIAG_GET_PACKET_VERBOSE 0
+/*
+ * GET_PACKET SPI backend:
+ *   0 = SDK hardware GSPI transfer path (default, same path as normal commands)
+ *   1 = soft/bit-banged SPI fallback for debugging
+ *   2 = raw polled GSPI FIFO experiment
+ */
+#define LR1121_GET_PACKET_SPI_BACKEND 0
 
 #include <stdbool.h>
 #include <string.h>
 
-#include "hw_timer.h" // Prevent SPI pre-emption
 
 /* Soft SPI function removed - Logic inlined in spi_transfer */
 
@@ -260,6 +270,7 @@
 #define GSPI_CONFIG1_MANUAL_RD (1UL << 2)
 #define GSPI_CONFIG1_FULL_DUPLEX_EN (1UL << 15)
 #define GSPI_WRITE_DATA2_USE_PREV_LENGTH (1UL << 7)
+#define GSPI_CONFIG2_TAKE_MANUAL_WR_SIZE (1UL << 10)
 #define GSPI_BUS_MODE_GPIO_MODE_EN (0x3FUL << 5)
 #define GSPI_CLK_CONFIG_CLK_EN (1UL << 1)
 #define GSPI_CONFIG2_RD_DATA_SWAP_ALL ((1UL << 4) | (1UL << 5) | (1UL << 6))
@@ -524,9 +535,6 @@ static int read_busy_pin(void) { return HP_GPIO_READ(LR1121_PIN_BUSY); }
  * GPIO_28 (CS) is bit 12 of PORT 1
  */
 static void cs_assert(void) {
-  /* Pause hardware timer ISR to prevent SPI re-entrancy from hwTimer */
-  hw_timer_pause_isr();
-
   HP_GPIO_SET_LOW(LR1121_PIN_NSS);
   delay_us(1); /* NSS setup time */
 }
@@ -540,9 +548,6 @@ static void cs_deassert(void) {
   delay_us(1); /* NSS hold time */
   HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
   delay_us(1); /* Inter-transaction gap */
-
-  /* Resume hardware timer ISR now that SPI is fully complete */
-  hw_timer_resume_isr();
 }
 
 /**
@@ -590,6 +595,7 @@ static bool spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
   }
 
   const uint32_t saved_config1 = GSPI_CONFIG1_REG;
+  const uint32_t saved_config2 = GSPI_CONFIG2_REG;
   const uint32_t saved_write_data2 = GSPI_WRITE_DATA2_REG;
   const uint32_t saved_fifo_thrld = GSPI_FIFO_THRLD_REG;
   const uint32_t gspi_irq_was_enabled = NVIC_GetEnableIRQ(GSPI0_IRQn);
@@ -604,8 +610,11 @@ static bool spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
   GSPI_INTR_ACK_REG = GSPI_INTR_ACK_BIT;
   gspi_reset_fifos();
 
+  // RM 20.5.5: bits [3:0] select the valid bits per manual write frame.
+  // Program 8 bits explicitly instead of relying on USE_PREV_LENGTH state.
   GSPI_WRITE_DATA2_REG =
-      (saved_write_data2 & ~0x0FUL) | 8U | GSPI_WRITE_DATA2_USE_PREV_LENGTH;
+      (saved_write_data2 & ~(0x0FUL | GSPI_WRITE_DATA2_USE_PREV_LENGTH)) | 8U;
+  GSPI_CONFIG2_REG = saved_config2 & ~GSPI_CONFIG2_TAKE_MANUAL_WR_SIZE;
   GSPI_CONFIG1_REG =
       (saved_config1 | GSPI_CONFIG1_MANUAL_WR | GSPI_CONFIG1_FULL_DUPLEX_EN) &
       ~GSPI_CONFIG1_MANUAL_RD;
@@ -653,6 +662,7 @@ static bool spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
   }
 
   GSPI_CONFIG1_REG = saved_config1;
+  GSPI_CONFIG2_REG = saved_config2;
   GSPI_WRITE_DATA2_REG = saved_write_data2;
   GSPI_FIFO_THRLD_REG = saved_fifo_thrld;
   GSPI_INTR_ACK_REG = GSPI_INTR_ACK_BIT;
@@ -2114,14 +2124,6 @@ static bool soft_spi_transfer_with_cs(const uint8_t *tx_data, uint8_t *rx_data,
     return true;
   }
 
-  /*
-   * Soft SPI is used on the hot ELRS paths (GET_PACKET and SetFreq+Rx). It
-   * must get the same timer exclusion as the hardware-GSPI CS helpers, or a
-   * CT TICK/TOCK can preempt a bit-banged packet read and retune the LR1121 in
-   * the middle of the transaction.
-   */
-  hw_timer_pause_isr();
-
   const uint32_t cfg_sck = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK);
   const uint32_t cfg_miso = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO);
   const uint32_t cfg_mosi = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI);
@@ -2189,8 +2191,6 @@ static bool soft_spi_transfer_with_cs(const uint8_t *tx_data, uint8_t *rx_data,
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI) = cfg_mosi;
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS) = cfg_nss;
 
-  hw_timer_resume_isr();
-
   return true;
 }
 
@@ -2234,11 +2234,15 @@ lr1121_send_command_polled(uint16_t opcode, const uint8_t *params,
     memcpy(&tx_buf[2], params, param_len);
   }
 
+#if LR1121_DIAG_GET_PACKET_VERBOSE
   DEBUGOUT("[GP] cmd 0x%04X begin\n", opcode);
+#endif
   cs_assert();
   const bool result = spi_transfer_polled(tx_buf, rx_buf, total_len);
   cs_deassert();
+#if LR1121_DIAG_GET_PACKET_VERBOSE
   DEBUGOUT("[GP] cmd 0x%04X end ok=%u\n", opcode, result ? 1U : 0U);
+#endif
 
   return result;
 }
@@ -2274,13 +2278,17 @@ lr1121_read_response_polled(uint8_t *response, uint16_t response_len) {
   memset(tx_buf, 0x00, response_len);
   memset(response, 0xBB, response_len);
 
+#if LR1121_DIAG_GET_PACKET_VERBOSE
   DEBUGOUT("[GP] resp-polled begin len=%u\n", response_len);
+#endif
   cs_assert();
   const bool result = spi_transfer_polled(tx_buf, response, response_len);
   cs_deassert();
+#if LR1121_DIAG_GET_PACKET_VERBOSE
   DEBUGOUT("[GP] resp-polled end ok=%u b0=%02X b1=%02X\n", result ? 1U : 0U,
            response_len > 0 ? response[0] : 0U,
            response_len > 1 ? response[1] : 0U);
+#endif
 
   return result;
 }
@@ -2292,18 +2300,25 @@ bool lr1121_elrs_get_packet(uint8_t *response, uint16_t response_len,
   }
 
   /*
-   * Use the ELRS GET_PACKET command with the SiW917 soft response path. The
-   * fused 0x0702 path is stable but returns bytes that fail ELRS CRC for this
-   * receiver flow, while 0x0700 produced accepted packets once the Radio
-   * instance pointer was fixed.
+   * Use the ELRS GET_PACKET command. The soft response path is kept as a debug
+   * fallback, but the normal RX hot path should use polled hardware GSPI so a
+   * packet read does not consume multiple milliseconds bit-banging GPIO.
    */
   if (!lr1121_wait_busy_timeout(100)) {
     return false;
   }
 
-  const bool command_ok =
-      use_soft_response ? lr1121_send_command_soft(0x0700, NULL, 0)
-                        : lr1121_send_command_polled(0x0700, NULL, 0);
+#if LR1121_GET_PACKET_SPI_BACKEND == 1
+  (void)use_soft_response;
+  const bool command_ok = lr1121_send_command_soft(0x0700, NULL, 0);
+#elif LR1121_GET_PACKET_SPI_BACKEND == 2
+  (void)use_soft_response;
+  const bool command_ok = lr1121_send_command_polled(0x0700, NULL, 0);
+#else
+  (void)use_soft_response;
+  const bool command_ok = lr1121_send_command_pub(0x0700, NULL, 0);
+#endif
+
   if (!command_ok) {
     return false;
   }
@@ -2312,8 +2327,13 @@ bool lr1121_elrs_get_packet(uint8_t *response, uint16_t response_len,
     return false;
   }
 
-  return use_soft_response ? lr1121_read_response_soft(response, response_len)
-                           : lr1121_read_response_polled(response, response_len);
+#if LR1121_GET_PACKET_SPI_BACKEND == 1
+  return lr1121_read_response_soft(response, response_len);
+#elif LR1121_GET_PACKET_SPI_BACKEND == 2
+  return lr1121_read_response_polled(response, response_len);
+#else
+  return lr1121_read_response(response, response_len);
+#endif
 }
 
 bool lr1121_elrs_set_freq_set_rx(uint32_t freq_hz, bool use_soft_command) {

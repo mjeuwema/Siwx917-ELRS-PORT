@@ -11,14 +11,9 @@
  *   - Timer fires twice per packet period (tick at mid-packet, tock when packet
  * expected)
  *
- * Citation: SiWx917 Family Reference Manual Section 33 - ULP Timers
- *   - Uses ULP Timer 1 in 1µs mode for precise timing
- *   - Timer0 reserved for SDK, Timer1 used for ELRS hwTimer
- *
- * IMPORTANT - Timer Hardware Constraints (RM Section 33.4.1):
- *   "Timer settings are LOCKED while the timer is running. To reprogram
- *   the timer, you must first set the MCUULP_TMRx_CNTRL.TMR_STOP bit."
- *   This implementation handles stop/reconfigure/start internally.
+ * Citation: SiWx917 Configurable Timer (CT)
+ *   - Uses CT Counter 0 in 16-bit periodic mode for ELRS timing
+ *   - The CT clock is configured at runtime for a 2 MHz timer base
  *
  * The hwTimer module is CRITICAL for:
  *   1. Phase-locking to TX timing via PFD (Phase Frequency Detector)
@@ -77,13 +72,10 @@ typedef void (*hw_timer_tock_callback_t)(void);
 /**
  * @brief Initialize the hardware timer
  *
- * Sets up ULP Timer 1 for ELRS tick/tock operation. The timer will fire
+ * Sets up CT Counter 0 for ELRS tick/tock operation. The timer will fire
  * twice per packet interval:
  *   - TOCK: At the expected packet arrival time
  *   - TICK: Mid-way between packets (for LQ calculation)
- *
- * Citation: SiWx917 RM Section 6.14.13.10 - ULP_TIMER_CLK_SEL
- *   Value 4 selects RC_32MHZ_CLK as timer clock source for 1µs resolution.
  *
  * @param interval_us Full packet interval in microseconds
  * @return SL_STATUS_OK on success, error code otherwise
@@ -135,7 +127,7 @@ void hw_timer_resume(void);
  * @brief Mark that the platform wrapper already delivered the immediate TOCK.
  *
  * ESP32 ELRS gets an immediate timer interrupt when resume() enables the alarm.
- * The SiW917 wrapper emulates that by calling the TOCK callback directly, so
+ * The SiW917 C++ wrapper queues that immediate TOCK for the main ELRS task, so
  * the C timer state must be advanced to make the next hardware edge a TICK.
  */
 void hw_timer_note_immediate_tock(void);
@@ -222,18 +214,19 @@ uint32_t hw_timer_get_interval(void);
  * Called by PFD when timer is running slow relative to TX.
  * Adds specified delta to the frequency offset.
  *
- * NOTE: The freq_offset is applied once per FULL interval (on TICK->TOCK only)
- * to match official ELRS PFD behavior.
+ * NOTE: The freq_offset is applied to every half interval, matching upstream
+ * ESP32_hwTimer.cpp. Its public unit is an upstream ESP32 RX timer tick:
+ * 5 units = 1 us.
  *
  * Citation: ExpressLRS hwTimer.h line 68
  *   static ICACHE_RAM_ATTR void inline incFreqOffset() { FreqOffset++; }
  *
- * @param delta Offset increment in microseconds (typically 1 or -1)
+ * @param delta Offset increment in upstream timer units (typically 1 or -1)
  */
 void hw_timer_inc_freq_offset(int32_t delta);
 
 /**
- * @brief Increment frequency offset by 1µs (ELRS compatibility wrapper)
+ * @brief Increment frequency offset by one upstream ELRS timer unit
  *
  * Citation: ExpressLRS hwTimer.h - incFreqOffset()
  */
@@ -242,7 +235,7 @@ static inline void hw_timer_inc_freq_offset_1us(void) {
 }
 
 /**
- * @brief Decrement frequency offset by 1µs (ELRS compatibility wrapper)
+ * @brief Decrement frequency offset by one upstream ELRS timer unit
  *
  * Citation: ExpressLRS hwTimer.h - decFreqOffset()
  */
@@ -262,13 +255,13 @@ void hw_timer_reset_freq_offset(void);
 /**
  * @brief Get current frequency offset
  *
- * Returns the accumulated frequency offset in microseconds.
+ * Returns the accumulated frequency offset in upstream timer units.
  *
  * Citation: ExpressLRS hwTimer.h line 79
  *   static ICACHE_RAM_ATTR int32_t inline getFreqOffset() { return FreqOffset;
  * }
  *
- * @return Current frequency offset in microseconds
+ * @return Current frequency offset in upstream timer units
  */
 int32_t hw_timer_get_freq_offset(void);
 
@@ -292,12 +285,29 @@ bool hw_timer_is_running(void);
  * Implementation uses a single total_half_ticks counter plus
  * the current timer count for sub-interval precision.
  *
- * Citation: SiWx917 RM Section 33.6.1 - Reading count register
- * returns time remaining (down-counter).
- *
  * @return Current time in microseconds (monotonic)
  */
 uint32_t hw_timer_get_micros(void);
+
+/**
+ * @brief Diagnostics: number of hardware half-interval interrupts processed.
+ */
+uint32_t hw_timer_get_total_half_ticks(void);
+
+/**
+ * @brief Diagnostics: current Counter 0 match value.
+ */
+uint32_t hw_timer_get_match_value(void);
+
+/**
+ * @brief Diagnostics: calibrated CT frequency used for match conversion.
+ */
+uint32_t hw_timer_get_ct_freq_hz(void);
+
+/**
+ * @brief Diagnostics: current Counter 0 count.
+ */
+uint32_t hw_timer_get_current_count(void);
 
 #ifdef __cplusplus
 }

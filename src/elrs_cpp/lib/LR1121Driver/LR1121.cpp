@@ -1,3 +1,4 @@
+#include "Arduino.h"
 #include "LR1121.h"
 #include "LR1121_hal.h"
 #include "logging.h"
@@ -20,6 +21,16 @@ extern "C" {
 LR1121Hal hal;
 LR1121Driver *LR1121Driver::instance = NULL;
 static volatile uint8_t siw917_last_payload_length = 8;
+static volatile uint32_t siw917_rxnbisr_entry_us = 0;
+static volatile uint32_t siw917_packet_ready_us = 0;
+
+extern "C" uint32_t lr1121_get_last_rxnbisr_entry_us(void) {
+  return siw917_rxnbisr_entry_us;
+}
+
+extern "C" uint32_t lr1121_get_last_packet_ready_us(void) {
+  return siw917_packet_ready_us;
+}
 
 static int UpdateFirmwareWithCDriver(
     const SX12XX_Radio_Number_t radioNumber) {
@@ -92,6 +103,7 @@ void ICACHE_RAM_ATTR CopyCodec::decode(uint8_t *out, uint8_t *in,
 
 LR1121Driver::LR1121Driver() : SX12xxDriverCommon() {
   useFSK = false;
+  rxContinuousActive = false;
   instance = this;
   strongestReceivingRadio = SX12XX_Radio_1;
   fallBackMode = LR1121_MODE_FS;
@@ -379,6 +391,12 @@ void LR1121Driver::SetFSKSyncWord(uint8_t fskSyncWord1, uint8_t fskSyncWord2,
 
 void LR1121Driver::SetDioAsRfSwitch() {
   // 4.2.1 SetDioAsRfSwitch
+#if LR1121_BAND_24GHZ
+  // Match the proven SiW917/LR1121 bring-up path: the 2.4 GHz RFIO_HF path
+  // does not use the external PE4259 switch, so leave DIO5/DIO6 idle.
+  DBGLN("SetDioAsRfSwitch skipped for 2.4GHz RFIO_HF path");
+  return;
+#else
   uint8_t switchbuf[8];
 #if defined(LR1121_RFSW_CTRL) && (LR1121_RFSW_CTRL_COUNT == 8)
   switchbuf[0] = LR1121_RFSW_CTRL[0]; // RfswEnable
@@ -408,6 +426,7 @@ void LR1121Driver::SetDioAsRfSwitch() {
 #endif
   hal.WriteCommand(LR11XX_SYSTEM_SET_DIO_AS_RF_SWITCH_OC, switchbuf,
                    sizeof(switchbuf), SX12XX_Radio_All);
+#endif
 }
 
 void LR1121Driver::CorrectRegisterForSF6(uint8_t sf,
@@ -565,23 +584,27 @@ void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
   switch (OPmode) {
   case LR1121_MODE_SLEEP:
     // 2.1.5.1 SetSleep
+    rxContinuousActive = false;
     hal.WriteCommand(LR11XX_SYSTEM_SET_SLEEP_OC, buf, 5, radioNumber);
     break;
 
   case LR1121_MODE_STDBY_RC:
     // 2.1.2.1 SetStandby
+    rxContinuousActive = false;
     buf[0] = 0x00;
     hal.WriteCommand(LR11XX_SYSTEM_SET_STANDBY_OC, buf, 1, radioNumber);
     break;
 
   case LR1121_MODE_STDBY_XOSC:
     // 2.1.2.1 SetStandby
+    rxContinuousActive = false;
     buf[0] = 0x01;
     hal.WriteCommand(LR11XX_SYSTEM_SET_STANDBY_OC, buf, 1, radioNumber);
     break;
 
   case LR1121_MODE_FS:
     // 2.1.9.1 SetFs
+    rxContinuousActive = false;
     hal.WriteCommand(LR11XX_SYSTEM_SET_FS_OC, radioNumber);
     break;
 
@@ -596,11 +619,13 @@ void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
     buf[1] = 0xFF;
     buf[2] = 0xFF; // Continuous RX
     hal.WriteCommand(LR11XX_RADIO_SET_RX_OC, buf, 3, radioNumber);
+    rxContinuousActive = true;
     break;
   }
 
   case LR1121_MODE_TX:
     // Table 7-3: SetTx Command
+    rxContinuousActive = false;
     hal.WriteCommand(LR11XX_RADIO_SET_TX_OC, buf, 3, radioNumber);
     break;
 
@@ -655,24 +680,21 @@ void LR1121Driver::SetPacketParamsLoRa(
 void ICACHE_RAM_ATTR
 LR1121Driver::SetFrequencyReg(uint32_t freq, SX12XX_Radio_Number_t radioNumber,
                               bool doRx, uint32_t rxTime) {
-  // Citation: LR1121 User Manual Section 7.2.3 SetRfFrequency
-  // "The command SetRfFrequency must be issued in STDBY_RC or STDBY_XOSC modes"
-  // ELRS continuously calls this while in RX_CONT, which causes SPI failure.
-  SetMode(LR1121_MODE_STDBY_XOSC, radioNumber);
-
+  const uint32_t timeout = rxTime != 0 ? rxTime : 0xFFFFFFU;
   uint8_t buf[7] = {
       (uint8_t)(freq >> 24),
       (uint8_t)(freq >> 16),
       (uint8_t)(freq >> 8),
       (uint8_t)(freq),
-      0xFF,
-      0xFF,
-      0xFF,
+      (uint8_t)(timeout >> 16),
+      (uint8_t)(timeout >> 8),
+      (uint8_t)(timeout),
   };
   if (doRx) {
     // SetRfFrequency_SetRX
     hal.WriteCommand(LR11XX_RADIO_SET_FREQ_SET_RX, buf, sizeof(buf),
                      radioNumber);
+    rxContinuousActive = true;
   } else {
     // 7.2.1 SetRfFrequency
     hal.WriteCommand(LR11XX_RADIO_SET_RF_FREQUENCY_OC, buf, 4, radioNumber);
@@ -770,6 +792,8 @@ void ICACHE_RAM_ATTR LR1121Driver::TXnb(
     return;
   }
 
+  rxContinuousActive = false;
+
 #if defined(DEBUG_RCVR_SIGNAL_STATS)
   if (radioNumber == SX12XX_Radio_All || radioNumber == SX12XX_Radio_1) {
     rxSignalStats[0].telem_count++;
@@ -840,6 +864,7 @@ inline void ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
 }
 
 bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
+  siw917_rxnbisr_entry_us = micros();
   const uint8_t effectivePayloadLength =
       PayloadLength != 0 ? PayloadLength : siw917_last_payload_length;
   bool packetAccepted = false;
@@ -847,6 +872,7 @@ bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
   // GetPacket
   hal.WriteCommand(LR11XX_RADIO_GET_PACKET, radioNumber);
   hal.ReadCommand(rx_buf, effectivePayloadLength + 6, radioNumber);
+  siw917_packet_ready_us = micros();
 
   codec->decode(RXdataBuffer, rx_buf + 6, effectivePayloadLength);
   packetAccepted = RXdoneCallback(SX12XX_RX_OK);
@@ -856,10 +882,6 @@ bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
 #endif
   }
 
-  // The SiW917/LR1121 path appears to leave RX after RX_DONE often enough that
-  // relying on the 0xFFFFFF "continuous" timeout causes sparse RX interrupts
-  // and eventual link timeout. Re-arm RX explicitly after every packet read.
-  RXnb();
   return packetAccepted;
 }
 

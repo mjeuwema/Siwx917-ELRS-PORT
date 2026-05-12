@@ -997,6 +997,7 @@ void elrs_cpp_task(void *argument) {
   extern void elrs_rx_stop(void);
   extern void test_lr1121_dma_shift(void);
   extern bool elrs_is_connected(void);
+  extern bool lr1121_hal_has_pending_dio1(void);
 
   DEBUGOUT("[ELRS] Initializing receiver...\n");
   elrs_rx_init();
@@ -1071,8 +1072,15 @@ void elrs_cpp_task(void *argument) {
     /* Normal RX processing - matches upstream loop() */
     elrs_rx_loop();
 
-    /* Yield to FreeRTOS scheduler */
-    osDelay(1);
+    /* If DIO1 is already pending, do not add another tick of latency before
+     * the ELRS loop can drain the radio IRQ. Otherwise sleep normally so
+     * buttons, LEDs, and WiFi housekeeping still get CPU time.
+     */
+    if (lr1121_hal_has_pending_dio1()) {
+      osThreadYield();
+    } else {
+      osDelay(1);
+    }
   }
 }
 #endif /* TEST_MODE_ELRS_CPP_TEST */
@@ -1330,7 +1338,7 @@ void gspi_example_init(void) {
   static const osThreadAttr_t elrs_cpp_task_attributes = {
       .name = "elrs_cpp_task",
       .stack_size = 8192,
-      .priority = osPriorityNormal};
+      .priority = osPriorityAboveNormal};
 
   osThreadId_t task_handle =
       osThreadNew(elrs_cpp_task, NULL, &elrs_cpp_task_attributes);
