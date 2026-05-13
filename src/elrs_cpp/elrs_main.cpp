@@ -70,6 +70,7 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 0
 #define ELRS_DIAG_CRC_NONCE_WINDOW 0
 #define ELRS_DIAG_RX_LUA_UL 1
+#define ELRS_DIAG_RX_LUA_UL_VERBOSE 0
 #define ELRS_DIAG_RX_LUA_UL_PRINT_LIMIT 24
 #define ELRS_DIAG_RX_LUA_UL_PRINT_EVERY 128
 ///////////////////
@@ -217,12 +218,18 @@ enum RxLuaParamId : uint8_t {
   RX_LUA_PARAM_ROOT = 0,
   RX_LUA_PARAM_PROTOCOL = 1,
   RX_LUA_PARAM_FAILSAFE = 2,
-  RX_LUA_PARAM_FORCE_TLM = 3,
-  RX_LUA_PARAM_WIFI = 4,
-  RX_LUA_PARAM_BIND = 5,
-  RX_LUA_PARAM_MODEL_ID = 6,
-  RX_LUA_PARAM_TLM_RATIO = 7,
-  RX_LUA_PARAM_VERSION = 8,
+  RX_LUA_PARAM_TARGET_SYS_ID = 3,
+  RX_LUA_PARAM_SOURCE_SYS_ID = 4,
+  RX_LUA_PARAM_FORCE_TLM = 5,
+  RX_LUA_PARAM_WIFI = 6,
+  RX_LUA_PARAM_TEAM_RACE = 7,
+  RX_LUA_PARAM_TEAM_RACE_CHANNEL = 8,
+  RX_LUA_PARAM_TEAM_RACE_POSITION = 9,
+  RX_LUA_PARAM_BIND_STORAGE = 10,
+  RX_LUA_PARAM_BIND = 11,
+  RX_LUA_PARAM_MODEL_ID = 12,
+  RX_LUA_PARAM_TLM_RATIO = 13,
+  RX_LUA_PARAM_VERSION = 14,
   RX_LUA_PARAM_COUNT = RX_LUA_PARAM_VERSION,
 };
 
@@ -309,6 +316,16 @@ static uint8_t selectionOptionMax(const char *options) {
     }
   }
   return max;
+}
+
+static uint8_t clampU8(uint8_t value, uint8_t minValue, uint8_t maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return value;
 }
 
 static uint32_t versionStringToU32(const char *verStr) {
@@ -414,9 +431,9 @@ static bool validateCrsfFrame(const uint8_t *frame, uint8_t *frameLen) {
   const uint8_t crc =
       crsfCalcFrameCrc(frame + CRSF_FRAME_NOT_COUNTED_BYTES, frameSize - 1);
   if (crc != frame[totalLen - 1]) {
+#if ELRS_DIAG_RX_LUA_UL
     DBGLN("[RX_LUA] Dropping CRSF frame with bad CRC type=0x%02X calc=0x%02X got=0x%02X",
           frame[CRSF_TELEMETRY_TYPE_INDEX], crc, frame[totalLen - 1]);
-#if ELRS_DIAG_RX_LUA_UL
     rxLuaDiagReject("crc", frame);
 #endif
     return false;
@@ -444,7 +461,7 @@ static void rxLuaQueueFrame(const uint8_t *frame, uint8_t len) {
   rxLuaQueueLen[rxLuaQueueTail] = len;
   rxLuaQueueTail = (uint8_t)((rxLuaQueueTail + 1) % RX_LUA_QUEUE_DEPTH);
   rxLuaQueueCount++;
-#if ELRS_DIAG_RX_LUA_UL
+#if ELRS_DIAG_RX_LUA_UL && ELRS_DIAG_RX_LUA_UL_VERBOSE
   DBGLN("[RX_LUA] queued response type=0x%02X len=%u q=%u",
         frame[CRSF_TELEMETRY_TYPE_INDEX], len, rxLuaQueueCount);
 #endif
@@ -467,15 +484,7 @@ static uint8_t getProtocolSelectionFromConfig(const elrs_config_t *cfg) {
     return 0;
   }
 
-  switch ((elrs_serial_protocol_t)cfg->serial_protocol) {
-  case ELRS_SERIAL_SBUS:
-    return 1;
-  case ELRS_SERIAL_MAVLINK:
-    return 2;
-  case ELRS_SERIAL_CRSF:
-  default:
-    return 0;
-  }
+  return cfg->serial_protocol <= ELRS_SERIAL_GPS ? cfg->serial_protocol : 0;
 }
 
 static void rxLuaRefreshDynamicValues() {
@@ -525,6 +534,7 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
   rxLuaRefreshDynamicValues();
 
   uint8_t chunkBuffer[128] = {};
+  uint8_t parent = RX_LUA_PARAM_ROOT;
   uint8_t paramType = 0;
   const char *name = "";
   const char *value = "";
@@ -533,34 +543,76 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
   uint8_t selectionValue = 0;
   uint8_t selectionMin = 0;
   uint8_t selectionMax = 0;
+  uint8_t intValue = 0;
+  uint8_t intMin = 0;
+  uint8_t intMax = 0;
+  uint8_t intDefault = 0;
   uint8_t commandStep = RX_LUA_CMD_IDLE;
   const char *commandInfo = "";
-  bool isFolder = false;
+  const uint8_t *folderChildren = nullptr;
+  bool hidden = false;
 
   elrs_config_t *cfg = elrs_config_get();
 
   switch (parameterIndex) {
   case RX_LUA_PARAM_ROOT:
-    isFolder = true;
     paramType = CRSF_FOLDER;
     name = device_name;
+    {
+      static const uint8_t rootChildren[] = {
+          RX_LUA_PARAM_PROTOCOL,
+          RX_LUA_PARAM_FAILSAFE,
+          RX_LUA_PARAM_TARGET_SYS_ID,
+          RX_LUA_PARAM_SOURCE_SYS_ID,
+          RX_LUA_PARAM_FORCE_TLM,
+          RX_LUA_PARAM_WIFI,
+          RX_LUA_PARAM_TEAM_RACE,
+          RX_LUA_PARAM_BIND_STORAGE,
+          RX_LUA_PARAM_BIND,
+          RX_LUA_PARAM_MODEL_ID,
+          RX_LUA_PARAM_TLM_RATIO,
+          RX_LUA_PARAM_VERSION,
+          0xFF,
+      };
+      folderChildren = rootChildren;
+    }
     break;
   case RX_LUA_PARAM_PROTOCOL:
     paramType = CRSF_TEXT_SELECTION;
     name = "Protocol";
-    options = "CRSF;SBUS;MAVLink";
+    options = "CRSF;Inverted CRSF;SBUS;Inverted SBUS;SUMD;DJI RS Pro;HoTT Telemetry;MAVLink;DisplayPort;GPS";
     selectionValue = getProtocolSelectionFromConfig(cfg);
     selectionMax = selectionOptionMax(options);
     break;
   case RX_LUA_PARAM_FAILSAFE:
     paramType = CRSF_TEXT_SELECTION;
     name = "SBUS failsafe";
-    options = "No Pulses;Last Pos;Set Pos";
+    options = "No Pulses;Last Pos";
     selectionValue =
-        cfg != nullptr && cfg->failsafe_mode <= ELRS_FAILSAFE_SET
+        cfg != nullptr && cfg->failsafe_mode <= ELRS_FAILSAFE_LAST
             ? cfg->failsafe_mode
             : (uint8_t)ELRS_FAILSAFE_NO_PULSES;
     selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_TARGET_SYS_ID:
+    paramType = CRSF_UINT8;
+    name = "Target SysID";
+    intValue = clampU8(cfg != nullptr ? cfg->mavlink_target_sys_id : 1, 1, 255);
+    intMin = 1;
+    intMax = 255;
+    intDefault = 1;
+    units = "";
+    hidden = getProtocolSelectionFromConfig(cfg) != ELRS_SERIAL_MAVLINK;
+    break;
+  case RX_LUA_PARAM_SOURCE_SYS_ID:
+    paramType = CRSF_UINT8;
+    name = "Source SysID";
+    intValue = clampU8(cfg != nullptr ? cfg->mavlink_source_sys_id : 255, 1, 255);
+    intMin = 1;
+    intMax = 255;
+    intDefault = 255;
+    units = "";
+    hidden = getProtocolSelectionFromConfig(cfg) != ELRS_SERIAL_MAVLINK;
     break;
   case RX_LUA_PARAM_FORCE_TLM:
     paramType = CRSF_TEXT_SELECTION;
@@ -574,6 +626,41 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     name = "WiFi Mode";
     commandStep = rxLuaWifiCommandStep;
     commandInfo = rxLuaWifiCommandInfo;
+    break;
+  case RX_LUA_PARAM_TEAM_RACE:
+    paramType = CRSF_FOLDER;
+    name = "Team Race";
+    {
+      static const uint8_t teamRaceChildren[] = {
+          RX_LUA_PARAM_TEAM_RACE_CHANNEL,
+          RX_LUA_PARAM_TEAM_RACE_POSITION,
+          0xFF,
+      };
+      folderChildren = teamRaceChildren;
+    }
+    break;
+  case RX_LUA_PARAM_TEAM_RACE_CHANNEL:
+    parent = RX_LUA_PARAM_TEAM_RACE;
+    paramType = CRSF_TEXT_SELECTION;
+    name = "Channel";
+    options = "AUX2;AUX3;AUX4;AUX5;AUX6;AUX7;AUX8;AUX9;AUX10;AUX11;AUX12";
+    selectionValue = clampU8(cfg != nullptr ? cfg->teamrace_channel : 0, 0, 10);
+    selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_TEAM_RACE_POSITION:
+    parent = RX_LUA_PARAM_TEAM_RACE;
+    paramType = CRSF_TEXT_SELECTION;
+    name = "Position";
+    options = "Disabled;1/Low;2;3;Mid;4;5;6/High";
+    selectionValue = clampU8(cfg != nullptr ? cfg->teamrace_position : 0, 0, 7);
+    selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_BIND_STORAGE:
+    paramType = CRSF_TEXT_SELECTION;
+    name = "Bind Storage";
+    options = "Persistent;Volatile;Returnable;Administered";
+    selectionValue = clampU8(cfg != nullptr ? cfg->bind_storage : 0, 0, 3);
+    selectionMax = selectionOptionMax(options);
     break;
   case RX_LUA_PARAM_BIND:
     paramType = CRSF_COMMAND;
@@ -600,16 +687,16 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     return false;
   }
 
-  chunkBuffer[2] = 0; // parent
-  chunkBuffer[3] = paramType;
+  chunkBuffer[2] = parent;
+  chunkBuffer[3] = hidden ? (paramType | CRSF_FIELD_HIDDEN) : paramType;
 
   uint8_t *next = appendCString(&chunkBuffer[4], name);
   switch (paramType & CRSF_FIELD_TYPE_MASK) {
   case CRSF_FOLDER:
-    if (isFolder) {
+    if (folderChildren != nullptr) {
       next = appendCString(&chunkBuffer[4], name);
-      for (uint8_t i = RX_LUA_PARAM_PROTOCOL; i <= RX_LUA_PARAM_COUNT; i++) {
-        *next++ = i;
+      for (const uint8_t *child = folderChildren; *child != 0xFF; child++) {
+        *next++ = *child;
       }
       *next++ = 0xFF;
     }
@@ -620,6 +707,13 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     *next++ = selectionMin;
     *next++ = selectionMax;
     *next++ = 0; // default
+    next = appendCString(next, units);
+    break;
+  case CRSF_UINT8:
+    *next++ = intValue;
+    *next++ = intMin;
+    *next++ = intMax;
+    *next++ = intDefault;
     next = appendCString(next, units);
     break;
   case CRSF_COMMAND:
@@ -693,8 +787,7 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
   case RX_LUA_PARAM_PROTOCOL:
     if (cfg != nullptr) {
       cfg->serial_protocol =
-          (arg == 1) ? ELRS_SERIAL_SBUS
-                     : ((arg == 2) ? ELRS_SERIAL_MAVLINK : ELRS_SERIAL_CRSF);
+          (arg <= ELRS_SERIAL_GPS) ? arg : (uint8_t)ELRS_SERIAL_CRSF;
       rxLuaSaveConfig();
       rxLuaQueueParameter(origin, parameterIndex, 0);
     }
@@ -702,7 +795,21 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
   case RX_LUA_PARAM_FAILSAFE:
     if (cfg != nullptr) {
       cfg->failsafe_mode =
-          arg <= ELRS_FAILSAFE_SET ? arg : (uint8_t)ELRS_FAILSAFE_NO_PULSES;
+          arg <= ELRS_FAILSAFE_LAST ? arg : (uint8_t)ELRS_FAILSAFE_NO_PULSES;
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_TARGET_SYS_ID:
+    if (cfg != nullptr) {
+      cfg->mavlink_target_sys_id = clampU8(arg, 1, 255);
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_SOURCE_SYS_ID:
+    if (cfg != nullptr) {
+      cfg->mavlink_source_sys_id = clampU8(arg, 1, 255);
       rxLuaSaveConfig();
       rxLuaQueueParameter(origin, parameterIndex, 0);
     }
@@ -721,6 +828,27 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
                         arg == RX_LUA_CMD_QUERY);
     rxLuaPendingActionAtMs = millis();
     rxLuaQueueParameter(origin, parameterIndex, 0);
+    break;
+  case RX_LUA_PARAM_TEAM_RACE_CHANNEL:
+    if (cfg != nullptr) {
+      cfg->teamrace_channel = clampU8(arg, 0, 10);
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_TEAM_RACE_POSITION:
+    if (cfg != nullptr) {
+      cfg->teamrace_position = clampU8(arg, 0, 7);
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_BIND_STORAGE:
+    if (cfg != nullptr) {
+      cfg->bind_storage = clampU8(arg, 0, 3);
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
     break;
   case RX_LUA_PARAM_BIND:
     rxLuaBindCommandStep = RX_LUA_CMD_EXECUTING;
@@ -765,7 +893,9 @@ static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
   switch (frameType) {
   case CRSF_FRAMETYPE_DEVICE_PING:
     rxLuaCrsfHandledCount++;
+#if ELRS_DIAG_RX_LUA_UL
     DBGLN("[RX_LUA] DEVICE_PING from 0x%02X", origin);
+#endif
     rxLuaQueueDeviceInfo(origin);
     return true;
   case CRSF_FRAMETYPE_PARAMETER_READ:
@@ -773,8 +903,10 @@ static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
     if (frameLen >= sizeof(crsf_ext_header_t) + 2 + CRSF_FRAME_CRC_SIZE) {
       const uint8_t parameterIndex = payload[0];
       const uint8_t fieldChunk = payload[1];
+#if ELRS_DIAG_RX_LUA_UL && ELRS_DIAG_RX_LUA_UL_VERBOSE
       DBGLN("[RX_LUA] PARAM_READ id=%u chunk=%u from=0x%02X",
             parameterIndex, fieldChunk, origin);
+#endif
       if ((parameterIndex == RX_LUA_PARAM_WIFI) && fieldChunk == 0) {
         rxLuaWifiCommandStep = RX_LUA_CMD_IDLE;
         rxLuaWifiCommandInfo = "";
@@ -788,7 +920,9 @@ static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
   case CRSF_FRAMETYPE_PARAMETER_WRITE:
     rxLuaCrsfHandledCount++;
     if (frameLen >= sizeof(crsf_ext_header_t) + 2 + CRSF_FRAME_CRC_SIZE) {
+#if ELRS_DIAG_RX_LUA_UL
       DBGLN("[RX_LUA] PARAM_WRITE id=%u arg=%u", payload[0], payload[1]);
+#endif
       rxLuaHandleParameterWrite(origin, payload[0], payload[1]);
     }
     return true;
@@ -1247,6 +1381,7 @@ ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
 #if ELRS_DIAG_RX_LUA_UL
   const uint32_t ulChunkCount = ++rxLuaUlChunkCount;
   rxLuaLastUlPackageIndex = packageIndex;
+#if ELRS_DIAG_RX_LUA_UL_VERBOSE
   if (rxLuaShouldPrintDiag(ulChunkCount)) {
     DBGLN("[RX_LUA] UL chunk #%lu pkg=%u len=%u bytes:%02X %02X %02X %02X %02X %02X",
           (unsigned long)ulChunkCount, packageIndex, dataLen, payload[0],
@@ -1255,11 +1390,12 @@ ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
           dataLen > 5 ? payload[5] : 0);
   }
 #endif
+#endif
 
   DataUlReceiver.ReceiveData(packageIndex, payload, dataLen);
   if (DataUlReceiver.HasFinishedData()) {
     dataUlReady = true;
-#if ELRS_DIAG_RX_LUA_UL
+#if ELRS_DIAG_RX_LUA_UL && ELRS_DIAG_RX_LUA_UL_VERBOSE
     DBGLN("[RX_LUA] UL complete pending after pkg=%u first:%02X %02X %02X %02X %02X %02X %02X %02X",
           packageIndex, DataUlBuffer[0], DataUlBuffer[1], DataUlBuffer[2],
           DataUlBuffer[3], DataUlBuffer[4], DataUlBuffer[5], DataUlBuffer[6],
@@ -1639,12 +1775,14 @@ static void updateSwitchMode() {
 static void DataUlReceiveComplete() {
 #if ELRS_DIAG_RX_LUA_UL
   const uint32_t completeCount = ++rxLuaUlCompleteCount;
+#if ELRS_DIAG_RX_LUA_UL_VERBOSE
   if (rxLuaShouldPrintDiag(completeCount)) {
     DBGLN("[RX_LUA] UL complete #%lu first:%02X %02X %02X %02X %02X %02X %02X %02X",
           (unsigned long)completeCount, DataUlBuffer[0], DataUlBuffer[1],
           DataUlBuffer[2], DataUlBuffer[3], DataUlBuffer[4], DataUlBuffer[5],
           DataUlBuffer[6], DataUlBuffer[7]);
   }
+#endif
 #endif
 
   switch (DataUlBuffer[0]) {

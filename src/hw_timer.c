@@ -190,8 +190,9 @@ static inline void hw_timer_exit_critical(uint32_t primask) {
  * Uses the runtime-calculated ct_ticks_per_us which is set during init
  * based on the actual system clock. Target is 2 MHz (2 ticks per µs).
  *
- * The calibrated CT frequency is used for conversion, then clamped to the
- * Counter 0 16-bit range.
+ * The configured CT frequency is used for conversion, then clamped to the
+ * Counter 0 16-bit range. The FreeRTOS-based calibration pass is diagnostic
+ * only because scheduler/tick latency is too coarse for ELRS RF slot timing.
  */
 static uint32_t us_to_match_value(uint32_t us) {
   /*
@@ -389,16 +390,16 @@ static uint32_t hw_timer_calibrate_ct_frequency(uint32_t register_ct_freq) {
         register_ct_freq > measured_hz ? register_ct_freq : measured_hz;
     const uint32_t low =
         register_ct_freq > measured_hz ? measured_hz : register_ct_freq;
-    if (low != 0U && high > (low * 105U / 100U)) {
-      printf("hw_timer: measured CT base=%lu Hz rejected; using register "
-             "base=%lu Hz\n",
+
+    if (low != 0U && high > (low * 101U / 100U)) {
+      printf("hw_timer: measured CT diagnostic=%lu Hz differs from register "
+             "base=%lu Hz; using register base\n",
              (unsigned long)measured_hz, (unsigned long)register_ct_freq);
-      return register_ct_freq;
-    }
-    if (low != 0U && high > (low * 102U / 100U)) {
-      printf("hw_timer: WARNING register CT base=%lu Hz but measured=%lu Hz\n",
+    } else {
+      printf("hw_timer: using register CT base=%lu Hz (measured=%lu Hz)\n",
              (unsigned long)register_ct_freq, (unsigned long)measured_hz);
     }
+    return register_ct_freq;
   }
 
   return measured_hz;

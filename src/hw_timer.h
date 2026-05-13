@@ -300,7 +300,7 @@ uint32_t hw_timer_get_total_half_ticks(void);
 uint32_t hw_timer_get_match_value(void);
 
 /**
- * @brief Diagnostics: calibrated CT frequency used for match conversion.
+ * @brief Diagnostics: CT frequency used for match conversion.
  */
 uint32_t hw_timer_get_ct_freq_hz(void);
 

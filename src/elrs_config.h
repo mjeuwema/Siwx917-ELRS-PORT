@@ -57,13 +57,17 @@ extern "C" {
  * Citation: ExpressLRS common.h - SERIAL_PROTOCOL enum
  ******************************************************************************/
 typedef enum {
-  ELRS_SERIAL_CRSF        = 0,   /* Crossfire protocol (default) */
-  ELRS_SERIAL_INVERTED    = 1,   /* Inverted CRSF */
-  ELRS_SERIAL_SBUS        = 2,   /* SBUS output */
-  ELRS_SERIAL_SUMD        = 3,   /* SUMD output */
-  ELRS_SERIAL_DJI_RS2_PRO = 4,   /* DJI RS2 Pro gimbal */
-  ELRS_SERIAL_HOTT_TLM    = 5,   /* HoTT telemetry */
-  ELRS_SERIAL_MAVLINK     = 6,   /* MAVLink */
+  ELRS_SERIAL_CRSF           = 0,   /* Crossfire protocol (default) */
+  ELRS_SERIAL_INVERTED_CRSF  = 1,   /* Inverted CRSF */
+  ELRS_SERIAL_INVERTED       = ELRS_SERIAL_INVERTED_CRSF, /* Legacy alias */
+  ELRS_SERIAL_SBUS           = 2,   /* SBUS output */
+  ELRS_SERIAL_INVERTED_SBUS  = 3,   /* Inverted SBUS output */
+  ELRS_SERIAL_SUMD           = 4,   /* SUMD output */
+  ELRS_SERIAL_DJI_RS2_PRO    = 5,   /* DJI RS2 Pro gimbal */
+  ELRS_SERIAL_HOTT_TLM       = 6,   /* HoTT telemetry */
+  ELRS_SERIAL_MAVLINK        = 7,   /* MAVLink */
+  ELRS_SERIAL_DISPLAYPORT    = 8,   /* MSP DisplayPort */
+  ELRS_SERIAL_GPS            = 9,   /* GPS */
 } elrs_serial_protocol_t;
 
 /*******************************************************************************
@@ -76,6 +80,18 @@ typedef enum {
   ELRS_FAILSAFE_LAST      = 1,   /* Hold last received values */
   ELRS_FAILSAFE_SET       = 2,   /* Use configured failsafe values */
 } elrs_failsafe_mode_t;
+
+/*******************************************************************************
+ * Bind Storage Options
+ *
+ * Citation: ExpressLRS RXParameters.cpp - "Bind Storage" selection
+ ******************************************************************************/
+typedef enum {
+  ELRS_BIND_STORAGE_PERSISTENT   = 0,
+  ELRS_BIND_STORAGE_VOLATILE     = 1,
+  ELRS_BIND_STORAGE_RETURNABLE   = 2,
+  ELRS_BIND_STORAGE_ADMINISTERED = 3,
+} elrs_bind_storage_t;
 
 /*******************************************************************************
  * Regulatory Domain Options
@@ -131,9 +147,16 @@ typedef struct __attribute__((packed)) {
   char     wifi_ssid[33];        /* WiFi AP SSID (max 32 chars + null) */
   char     wifi_password[65];    /* WiFi password (max 64 chars + null) */
   uint8_t  wifi_channel;         /* WiFi channel (1-13) */
-  
+
+  /* RX Lua / CRSF parameter settings */
+  uint8_t  mavlink_target_sys_id; /* MAVLink target system ID (1-255) */
+  uint8_t  mavlink_source_sys_id; /* MAVLink source system ID (1-255) */
+  uint8_t  teamrace_channel;      /* Team Race channel selection index */
+  uint8_t  teamrace_position;     /* Team Race position selection index */
+  uint8_t  bind_storage;          /* elrs_bind_storage_t */
+
   /* Reserved for future use */
-  uint8_t  reserved[32];
+  uint8_t  reserved[27];
   
   /* CRC for validation */
   uint16_t crc;                  /* CRC-16 of config data */

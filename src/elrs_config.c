@@ -98,6 +98,13 @@ static const elrs_config_t DEFAULT_CONFIG = {
   .wifi_ssid        = "ELRS_TEST_AP",
   .wifi_password    = "elrs1234",
   .wifi_channel     = 6,
+
+  /* RX Lua / CRSF parameter defaults */
+  .mavlink_target_sys_id = 1,
+  .mavlink_source_sys_id = 255,
+  .teamrace_channel      = 0,
+  .teamrace_position     = 0,
+  .bind_storage          = ELRS_BIND_STORAGE_PERSISTENT,
   
   /* Reserved zeros */
   .reserved         = { 0 },
@@ -161,6 +168,32 @@ static void update_config_crc(elrs_config_t* config)
 {
   size_t crc_len = sizeof(elrs_config_t) - sizeof(uint16_t);
   config->crc = calc_crc16((const uint8_t*)config, crc_len);
+}
+
+static void normalize_config_fields(elrs_config_t* config)
+{
+  if (config == NULL) {
+    return;
+  }
+
+  /* These fields were promoted from reserved bytes without changing the
+   * structure size, so older valid configs may still contain zero defaults.
+   */
+  if (config->mavlink_target_sys_id == 0) {
+    config->mavlink_target_sys_id = 1;
+  }
+  if (config->mavlink_source_sys_id == 0) {
+    config->mavlink_source_sys_id = 255;
+  }
+  if (config->teamrace_channel > 10) {
+    config->teamrace_channel = 0;
+  }
+  if (config->teamrace_position > 7) {
+    config->teamrace_position = 0;
+  }
+  if (config->bind_storage > ELRS_BIND_STORAGE_ADMINISTERED) {
+    config->bind_storage = ELRS_BIND_STORAGE_PERSISTENT;
+  }
 }
 
 /*******************************************************************************
@@ -273,8 +306,9 @@ int elrs_config_init(void)
   
   /***************************************************************************
    * Step 5: Use loaded configuration - SUCCESS!
-   **************************************************************************/
+  **************************************************************************/
   memcpy(&g_config, &loaded_config, sizeof(g_config));
+  normalize_config_fields(&g_config);
   g_initialized = true;
   
   DEBUGOUT("[Config] Successfully loaded configuration from NVM3!\n");
@@ -288,6 +322,7 @@ int elrs_config_init(void)
 save_and_use_defaults:
   DEBUGOUT("[Config] Saving defaults to NVM3...\n");
   memcpy(&g_config, &DEFAULT_CONFIG, sizeof(g_config));
+  normalize_config_fields(&g_config);
   g_config.flags |= ELRS_CONFIG_FLAG_VALID;
   update_config_crc(&g_config);
   
@@ -308,6 +343,7 @@ save_and_use_defaults:
 use_defaults:
   DEBUGOUT("[Config] Using hardcoded defaults (NVM3 unavailable)\n");
   memcpy(&g_config, &DEFAULT_CONFIG, sizeof(g_config));
+  normalize_config_fields(&g_config);
   g_config.flags |= ELRS_CONFIG_FLAG_VALID;
   update_config_crc(&g_config);
   g_initialized = true;
@@ -320,6 +356,7 @@ elrs_config_t* elrs_config_get(void)
   if (!g_initialized) {
     DEBUGOUT("[Config] WARNING: Config not initialized, returning defaults\n");
     memcpy(&g_config, &DEFAULT_CONFIG, sizeof(g_config));
+    normalize_config_fields(&g_config);
   }
   return &g_config;
 }
@@ -338,7 +375,9 @@ int elrs_config_save(void)
   }
   DEBUGOUT("[Config] g_initialized=true, proceeding...\n");
   fflush(stdout);
-  
+
+  normalize_config_fields(&g_config);
+
   /* Update CRC before saving */
   DEBUGOUT("[Config] Updating CRC...\n");
   update_config_crc(&g_config);
@@ -508,6 +547,11 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
         "\"sbus-failsafe\":%u,"
         "\"modelid\":%u,"
         "\"force-tlm\":%s,"
+        "\"target-sys-id\":%u,"
+        "\"source-sys-id\":%u,"
+        "\"teamrace-channel\":%u,"
+        "\"teamrace-position\":%u,"
+        "\"bind-storage\":%u,"
         "\"vbind\":%u"
       "},"
       "\"settings\":{"
@@ -542,6 +586,11 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
     cfg->failsafe_mode,
     cfg->model_id,
     cfg->force_tlm ? "true" : "false",
+    cfg->mavlink_target_sys_id,
+    cfg->mavlink_source_sys_id,
+    cfg->teamrace_channel,
+    cfg->teamrace_position,
+    cfg->bind_storage,
     cfg->vbind,
     elrs_config_is_bound() ? "Bound" : "Not Bound",
     cfg->wifi_ssid,
@@ -730,6 +779,53 @@ parse_other_fields:
       }
     }
   }
+
+  /* Parse MAVLink system IDs */
+  const char* target_sys_start = strstr(json, "\"target-sys-id\":");
+  if (target_sys_start != NULL) {
+    target_sys_start += 16;
+    int target_sys_val;
+    if (sscanf(target_sys_start, "%d", &target_sys_val) == 1) {
+      g_config.mavlink_target_sys_id = (uint8_t)target_sys_val;
+    }
+  }
+
+  const char* source_sys_start = strstr(json, "\"source-sys-id\":");
+  if (source_sys_start != NULL) {
+    source_sys_start += 16;
+    int source_sys_val;
+    if (sscanf(source_sys_start, "%d", &source_sys_val) == 1) {
+      g_config.mavlink_source_sys_id = (uint8_t)source_sys_val;
+    }
+  }
+
+  /* Parse Team Race and bind storage settings */
+  const char* teamrace_channel_start = strstr(json, "\"teamrace-channel\":");
+  if (teamrace_channel_start != NULL) {
+    teamrace_channel_start += 19;
+    int teamrace_channel_val;
+    if (sscanf(teamrace_channel_start, "%d", &teamrace_channel_val) == 1) {
+      g_config.teamrace_channel = (uint8_t)teamrace_channel_val;
+    }
+  }
+
+  const char* teamrace_position_start = strstr(json, "\"teamrace-position\":");
+  if (teamrace_position_start != NULL) {
+    teamrace_position_start += 20;
+    int teamrace_position_val;
+    if (sscanf(teamrace_position_start, "%d", &teamrace_position_val) == 1) {
+      g_config.teamrace_position = (uint8_t)teamrace_position_val;
+    }
+  }
+
+  const char* bind_storage_start = strstr(json, "\"bind-storage\":");
+  if (bind_storage_start != NULL) {
+    bind_storage_start += 15;
+    int bind_storage_val;
+    if (sscanf(bind_storage_start, "%d", &bind_storage_val) == 1) {
+      g_config.bind_storage = (uint8_t)bind_storage_val;
+    }
+  }
   
   /* Parse vbind */
   const char* vbind_start = strstr(json, "\"force-vbind\":");
@@ -748,6 +844,8 @@ parse_other_fields:
     }
   }
   
+  normalize_config_fields(&g_config);
+
   /* Mark as valid */
   g_config.flags |= ELRS_CONFIG_FLAG_VALID;
 
@@ -773,6 +871,11 @@ void elrs_config_print(void)
   DEBUGOUT("  Failsafe:   %d\n", cfg->failsafe_mode);
   DEBUGOUT("  Model ID:   %d\n", cfg->model_id);
   DEBUGOUT("  Force TLM:  %d\n", cfg->force_tlm);
+  DEBUGOUT("  MAVLink:    target=%d, source=%d\n",
+           cfg->mavlink_target_sys_id, cfg->mavlink_source_sys_id);
+  DEBUGOUT("  Team Race:  ch=%d, pos=%d\n",
+           cfg->teamrace_channel, cfg->teamrace_position);
+  DEBUGOUT("  Bind Store: %d\n", cfg->bind_storage);
   DEBUGOUT("  TX Power:   %d dBm\n", cfg->tx_power);
   DEBUGOUT("  Rate Index: %d\n", cfg->rate_index);
   DEBUGOUT("  WiFi SSID:  %s\n", cfg->wifi_ssid);
