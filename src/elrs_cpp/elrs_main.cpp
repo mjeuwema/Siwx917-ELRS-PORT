@@ -34,6 +34,7 @@
 #include "msptypes.h"
 
 // Standard includes
+#include <stdio.h>
 #include <string.h>
 
 // Status LED, bind button, persistent config, WiFi integration, and CRSF output
@@ -53,6 +54,7 @@ void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
                           uint32_t *tx_count, uint32_t *other_count,
                           uint32_t *last_irq);
 bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status);
+void elrs_enter_binding_mode(void);
 }
 
 //// CONSTANTS ////
@@ -67,6 +69,9 @@ bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status);
 #define ELRS_DIAG_DISABLE_CRSF_SERIAL 1
 #define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 0
 #define ELRS_DIAG_CRC_NONCE_WINDOW 0
+#define ELRS_DIAG_RX_LUA_UL 1
+#define ELRS_DIAG_RX_LUA_UL_PRINT_LIMIT 24
+#define ELRS_DIAG_RX_LUA_UL_PRINT_EVERY 128
 ///////////////////
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
@@ -188,6 +193,639 @@ static uint8_t pendingUid[UID_LEN] = {0};
 
 // SNR accumulator for telemetry (simplified - just use last value)
 static int8_t lastSnrRaw = 0;
+
+//=============================================================================
+// RX Lua / CRSF-over-OTA bridge
+//=============================================================================
+//
+// Downstream ESP32 routes uplink DATA frames through CRSFRouter/RXEndpoint and
+// feeds RXOTAConnector into StubbornSender. This is the same protocol shape, but
+// kept deliberately small for the SiW917 bring-up so the TX Lua can discover the
+// receiver and read/write a safe starter set of parameters.
+
+enum RxLuaCommandStep : uint8_t {
+  RX_LUA_CMD_IDLE = 0,
+  RX_LUA_CMD_CLICK = 1,
+  RX_LUA_CMD_EXECUTING = 2,
+  RX_LUA_CMD_ASK_CONFIRM = 3,
+  RX_LUA_CMD_CONFIRMED = 4,
+  RX_LUA_CMD_CANCEL = 5,
+  RX_LUA_CMD_QUERY = 6,
+};
+
+enum RxLuaParamId : uint8_t {
+  RX_LUA_PARAM_ROOT = 0,
+  RX_LUA_PARAM_PROTOCOL = 1,
+  RX_LUA_PARAM_FAILSAFE = 2,
+  RX_LUA_PARAM_FORCE_TLM = 3,
+  RX_LUA_PARAM_WIFI = 4,
+  RX_LUA_PARAM_BIND = 5,
+  RX_LUA_PARAM_MODEL_ID = 6,
+  RX_LUA_PARAM_TLM_RATIO = 7,
+  RX_LUA_PARAM_VERSION = 8,
+  RX_LUA_PARAM_COUNT = RX_LUA_PARAM_VERSION,
+};
+
+static char rxLuaModelIdValue[8] = "Off";
+static char rxLuaTlmRatioValue[8] = "1:1";
+static uint8_t rxLuaWifiCommandStep = RX_LUA_CMD_IDLE;
+static uint8_t rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
+static const char *rxLuaWifiCommandInfo = "";
+static const char *rxLuaBindCommandInfo = "";
+static bool rxLuaWifiPending = false;
+static bool rxLuaBindPending = false;
+static uint32_t rxLuaPendingActionAtMs = 0;
+static volatile uint32_t rxLuaUlChunkCount = 0;
+static volatile uint32_t rxLuaUlCompleteCount = 0;
+static volatile uint32_t rxLuaCrsfHandledCount = 0;
+static volatile uint32_t rxLuaCrsfRejectCount = 0;
+static volatile uint32_t rxLuaCrsfIgnoredCount = 0;
+static volatile uint8_t rxLuaLastUlPackageIndex = 0;
+
+#define RX_LUA_QUEUE_DEPTH 4
+static uint8_t rxLuaQueue[RX_LUA_QUEUE_DEPTH][CRSF_FRAME_SIZE_MAX];
+static uint8_t rxLuaQueueLen[RX_LUA_QUEUE_DEPTH] = {};
+static uint8_t rxLuaQueueHead = 0;
+static uint8_t rxLuaQueueTail = 0;
+static uint8_t rxLuaQueueCount = 0;
+
+#if ELRS_DIAG_RX_LUA_UL
+static bool rxLuaShouldPrintDiag(uint32_t count) {
+  return count <= ELRS_DIAG_RX_LUA_UL_PRINT_LIMIT ||
+         (ELRS_DIAG_RX_LUA_UL_PRINT_EVERY != 0 &&
+          (count % ELRS_DIAG_RX_LUA_UL_PRINT_EVERY) == 0);
+}
+
+static void rxLuaDiagReject(const char *reason, const uint8_t *frame) {
+  const uint32_t count = ++rxLuaCrsfRejectCount;
+  if (!rxLuaShouldPrintDiag(count)) {
+    return;
+  }
+
+  if (frame == nullptr) {
+    DBGLN("[RX_LUA] CRSF reject #%lu %s null",
+          (unsigned long)count, reason);
+    return;
+  }
+
+  DBGLN("[RX_LUA] CRSF reject #%lu %s bytes:%02X %02X %02X %02X %02X %02X %02X %02X",
+        (unsigned long)count, reason, frame[0], frame[1], frame[2], frame[3],
+        frame[4], frame[5], frame[6], frame[7]);
+}
+
+static void rxLuaDiagIgnore(const char *reason, const uint8_t *frame) {
+  const uint32_t count = ++rxLuaCrsfIgnoredCount;
+  if (!rxLuaShouldPrintDiag(count)) {
+    return;
+  }
+
+  DBGLN("[RX_LUA] CRSF ignore #%lu %s type=0x%02X dest=0x%02X orig=0x%02X",
+        (unsigned long)count, reason, frame[CRSF_TELEMETRY_TYPE_INDEX],
+        frame[3], frame[4]);
+}
+#endif
+
+static uint8_t *appendCString(uint8_t *dst, const char *src) {
+  if (src == nullptr) {
+    src = "";
+  }
+
+  do {
+    *dst++ = (uint8_t)*src;
+  } while (*src++ != '\0');
+
+  return dst;
+}
+
+static uint8_t selectionOptionMax(const char *options) {
+  uint8_t max = 0;
+  if (options == nullptr) {
+    return 0;
+  }
+
+  while (*options != '\0') {
+    if (*options++ == ';') {
+      max++;
+    }
+  }
+  return max;
+}
+
+static uint32_t versionStringToU32(const char *verStr) {
+  uint32_t retVal = 0;
+  uint8_t accumulator = 0;
+  bool trailingData = false;
+
+  while (verStr != nullptr && *verStr != '\0') {
+    const char c = *verStr++;
+    if (c == '.') {
+      retVal = (retVal << 8) | accumulator;
+      accumulator = 0;
+      trailingData = false;
+    } else if (c >= '0' && c <= '9') {
+      accumulator = (uint8_t)((accumulator * 10) + (c - '0'));
+      trailingData = true;
+    } else {
+      break;
+    }
+  }
+
+  if (trailingData) {
+    retVal = (retVal << 8) | accumulator;
+  }
+  return retVal < 0x010000 ? ((uint32_t)OTA_VERSION_ID << 16) : retVal;
+}
+
+static uint8_t crsfCalcFrameCrc(const uint8_t *data, uint8_t len);
+
+static void setCrsfHeaderAndCrc(uint8_t *frame, crsf_frame_type_e frameType,
+                                uint8_t frameSize) {
+  frame[0] = CRSF_SYNC_BYTE;
+  frame[1] = frameSize;
+  frame[2] = frameType;
+  frame[frameSize + CRSF_FRAME_NOT_COUNTED_BYTES - 1] =
+      crsfCalcFrameCrc(frame + CRSF_FRAME_NOT_COUNTED_BYTES, frameSize - 1);
+}
+
+static void setCrsfExtendedHeaderAndCrc(uint8_t *frame,
+                                        crsf_frame_type_e frameType,
+                                        uint8_t frameSize,
+                                        crsf_addr_e destAddr,
+                                        crsf_addr_e origAddr) {
+  frame[3] = destAddr;
+  frame[4] = origAddr;
+  setCrsfHeaderAndCrc(frame, frameType, frameSize);
+}
+
+static uint8_t crsfCalcFrameCrc(const uint8_t *data, uint8_t len) {
+  uint8_t crc = 0;
+  while (len--) {
+    crc ^= *data++;
+    for (uint8_t i = 0; i < 8; i++) {
+      crc = (uint8_t)((crc & 0x80) ? ((crc << 1) ^ CRSF_CRC_POLY)
+                                  : (crc << 1));
+    }
+  }
+  return crc;
+}
+
+static bool rxLuaIsKnownCrsfFrameAddress(uint8_t address) {
+  return address == CRSF_SYNC_BYTE ||
+         address == CRSF_ADDRESS_RADIO_TRANSMITTER ||
+         address == CRSF_ADDRESS_CRSF_RECEIVER ||
+         address == CRSF_ADDRESS_CRSF_TRANSMITTER ||
+         address == CRSF_ADDRESS_ELRS_LUA;
+}
+
+static bool validateCrsfFrame(const uint8_t *frame, uint8_t *frameLen) {
+  if (frame == nullptr) {
+#if ELRS_DIAG_RX_LUA_UL
+    rxLuaDiagReject("null", frame);
+#endif
+    return false;
+  }
+
+  // CRSF byte 0 is the bus/device address, not always CRSF_SYNC_BYTE. The TX
+  // Lua "Other Devices" ping arrives via OTA as 0xEE, matching upstream routing.
+  if (!rxLuaIsKnownCrsfFrameAddress(frame[0])) {
+#if ELRS_DIAG_RX_LUA_UL
+    rxLuaDiagReject("addr", frame);
+#endif
+    return false;
+  }
+
+  const uint8_t frameSize = frame[CRSF_TELEMETRY_LENGTH_INDEX];
+  if (frameSize < 2 ||
+      frameSize > (CRSF_FRAME_SIZE_MAX - CRSF_FRAME_NOT_COUNTED_BYTES)) {
+#if ELRS_DIAG_RX_LUA_UL
+    rxLuaDiagReject("len", frame);
+#endif
+    return false;
+  }
+
+  const uint8_t totalLen = frameSize + CRSF_FRAME_NOT_COUNTED_BYTES;
+  if (totalLen > ELRS_DATA_UL_BUFFER) {
+#if ELRS_DIAG_RX_LUA_UL
+    rxLuaDiagReject("buffer", frame);
+#endif
+    return false;
+  }
+
+  const uint8_t crc =
+      crsfCalcFrameCrc(frame + CRSF_FRAME_NOT_COUNTED_BYTES, frameSize - 1);
+  if (crc != frame[totalLen - 1]) {
+    DBGLN("[RX_LUA] Dropping CRSF frame with bad CRC type=0x%02X calc=0x%02X got=0x%02X",
+          frame[CRSF_TELEMETRY_TYPE_INDEX], crc, frame[totalLen - 1]);
+#if ELRS_DIAG_RX_LUA_UL
+    rxLuaDiagReject("crc", frame);
+#endif
+    return false;
+  }
+
+  if (frameLen != nullptr) {
+    *frameLen = totalLen;
+  }
+  return true;
+}
+
+static void rxLuaQueueFrame(const uint8_t *frame, uint8_t len) {
+  if (frame == nullptr || len == 0 || len > CRSF_FRAME_SIZE_MAX) {
+    return;
+  }
+
+  if (rxLuaQueueCount >= RX_LUA_QUEUE_DEPTH) {
+    // Keep latest UI responses moving; stale parameter entries are worse than
+    // dropping the oldest one during a burst of Lua polling.
+    rxLuaQueueHead = (uint8_t)((rxLuaQueueHead + 1) % RX_LUA_QUEUE_DEPTH);
+    rxLuaQueueCount--;
+  }
+
+  memcpy(rxLuaQueue[rxLuaQueueTail], frame, len);
+  rxLuaQueueLen[rxLuaQueueTail] = len;
+  rxLuaQueueTail = (uint8_t)((rxLuaQueueTail + 1) % RX_LUA_QUEUE_DEPTH);
+  rxLuaQueueCount++;
+#if ELRS_DIAG_RX_LUA_UL
+  DBGLN("[RX_LUA] queued response type=0x%02X len=%u q=%u",
+        frame[CRSF_TELEMETRY_TYPE_INDEX], len, rxLuaQueueCount);
+#endif
+}
+
+static void rxLuaPumpTelemetry() {
+  if (TelemetrySender.IsActive() || rxLuaQueueCount == 0) {
+    return;
+  }
+
+  const uint8_t len = rxLuaQueueLen[rxLuaQueueHead];
+  memcpy(TelemetryBuffer, rxLuaQueue[rxLuaQueueHead], len);
+  rxLuaQueueHead = (uint8_t)((rxLuaQueueHead + 1) % RX_LUA_QUEUE_DEPTH);
+  rxLuaQueueCount--;
+  TelemetrySender.SetDataToTransmit(TelemetryBuffer, len);
+}
+
+static uint8_t getProtocolSelectionFromConfig(const elrs_config_t *cfg) {
+  if (cfg == nullptr) {
+    return 0;
+  }
+
+  switch ((elrs_serial_protocol_t)cfg->serial_protocol) {
+  case ELRS_SERIAL_SBUS:
+    return 1;
+  case ELRS_SERIAL_MAVLINK:
+    return 2;
+  case ELRS_SERIAL_CRSF:
+  default:
+    return 0;
+  }
+}
+
+static void rxLuaRefreshDynamicValues() {
+  elrs_config_t *cfg = elrs_config_get();
+  const uint8_t modelId = cfg != nullptr ? cfg->model_id : modelMatchId;
+
+  if (modelId == 0xFF) {
+    strncpy(rxLuaModelIdValue, "Off", sizeof(rxLuaModelIdValue));
+  } else {
+    snprintf(rxLuaModelIdValue, sizeof(rxLuaModelIdValue), "%u", modelId);
+  }
+  rxLuaModelIdValue[sizeof(rxLuaModelIdValue) - 1] = '\0';
+
+  snprintf(rxLuaTlmRatioValue, sizeof(rxLuaTlmRatioValue), "1:%u",
+           ExpressLRS_currTlmDenom);
+  rxLuaTlmRatioValue[sizeof(rxLuaTlmRatioValue) - 1] = '\0';
+}
+
+static bool rxLuaBuildDeviceInfo(crsf_addr_e destAddr, uint8_t *frame,
+                                 uint8_t *frameLen) {
+  const uint8_t nameLen = (uint8_t)(strlen(device_name) + 1);
+  const uint8_t payloadLen = (uint8_t)(nameLen + sizeof(deviceInformationPacket_t));
+  const uint8_t frameSize = CRSF_EXT_FRAME_SIZE(payloadLen);
+
+  if ((frameSize + CRSF_FRAME_NOT_COUNTED_BYTES) > CRSF_FRAME_SIZE_MAX) {
+    return false;
+  }
+
+  memcpy(frame + sizeof(crsf_ext_header_t), device_name, nameLen);
+  auto *device = reinterpret_cast<deviceInformationPacket_t *>(
+      frame + sizeof(crsf_ext_header_t) + nameLen);
+  device->serialNo = htobe32(0x454C5253); // "ELRS"
+  device->hardwareVer = 0;
+  device->softwareVer = htobe32(versionStringToU32(version));
+  device->fieldCnt = RX_LUA_PARAM_COUNT;
+  device->parameterVersion = 0;
+
+  setCrsfExtendedHeaderAndCrc(frame, CRSF_FRAMETYPE_DEVICE_INFO, frameSize,
+                              destAddr, CRSF_ADDRESS_CRSF_RECEIVER);
+  *frameLen = frameSize + CRSF_FRAME_NOT_COUNTED_BYTES;
+  return true;
+}
+
+static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
+                                uint8_t fieldChunk, uint8_t *frame,
+                                uint8_t *frameLen) {
+  rxLuaRefreshDynamicValues();
+
+  uint8_t chunkBuffer[128] = {};
+  uint8_t paramType = 0;
+  const char *name = "";
+  const char *value = "";
+  const char *options = "";
+  const char *units = "";
+  uint8_t selectionValue = 0;
+  uint8_t selectionMin = 0;
+  uint8_t selectionMax = 0;
+  uint8_t commandStep = RX_LUA_CMD_IDLE;
+  const char *commandInfo = "";
+  bool isFolder = false;
+
+  elrs_config_t *cfg = elrs_config_get();
+
+  switch (parameterIndex) {
+  case RX_LUA_PARAM_ROOT:
+    isFolder = true;
+    paramType = CRSF_FOLDER;
+    name = device_name;
+    break;
+  case RX_LUA_PARAM_PROTOCOL:
+    paramType = CRSF_TEXT_SELECTION;
+    name = "Protocol";
+    options = "CRSF;SBUS;MAVLink";
+    selectionValue = getProtocolSelectionFromConfig(cfg);
+    selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_FAILSAFE:
+    paramType = CRSF_TEXT_SELECTION;
+    name = "SBUS failsafe";
+    options = "No Pulses;Last Pos;Set Pos";
+    selectionValue =
+        cfg != nullptr && cfg->failsafe_mode <= ELRS_FAILSAFE_SET
+            ? cfg->failsafe_mode
+            : (uint8_t)ELRS_FAILSAFE_NO_PULSES;
+    selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_FORCE_TLM:
+    paramType = CRSF_TEXT_SELECTION;
+    name = "Force Tlm";
+    options = "Off;On";
+    selectionValue = (cfg != nullptr && cfg->force_tlm != 0) ? 1 : 0;
+    selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_WIFI:
+    paramType = CRSF_COMMAND;
+    name = "WiFi Mode";
+    commandStep = rxLuaWifiCommandStep;
+    commandInfo = rxLuaWifiCommandInfo;
+    break;
+  case RX_LUA_PARAM_BIND:
+    paramType = CRSF_COMMAND;
+    name = "Enter Bind Mode";
+    commandStep = rxLuaBindCommandStep;
+    commandInfo = rxLuaBindCommandInfo;
+    break;
+  case RX_LUA_PARAM_MODEL_ID:
+    paramType = CRSF_INFO;
+    name = "Model Id";
+    value = rxLuaModelIdValue;
+    break;
+  case RX_LUA_PARAM_TLM_RATIO:
+    paramType = CRSF_INFO;
+    name = "Tlm Ratio";
+    value = rxLuaTlmRatioValue;
+    break;
+  case RX_LUA_PARAM_VERSION:
+    paramType = CRSF_INFO;
+    name = version;
+    value = commit;
+    break;
+  default:
+    return false;
+  }
+
+  chunkBuffer[2] = 0; // parent
+  chunkBuffer[3] = paramType;
+
+  uint8_t *next = appendCString(&chunkBuffer[4], name);
+  switch (paramType & CRSF_FIELD_TYPE_MASK) {
+  case CRSF_FOLDER:
+    if (isFolder) {
+      next = appendCString(&chunkBuffer[4], name);
+      for (uint8_t i = RX_LUA_PARAM_PROTOCOL; i <= RX_LUA_PARAM_COUNT; i++) {
+        *next++ = i;
+      }
+      *next++ = 0xFF;
+    }
+    break;
+  case CRSF_TEXT_SELECTION:
+    next = appendCString(next, options);
+    *next++ = selectionValue;
+    *next++ = selectionMin;
+    *next++ = selectionMax;
+    *next++ = 0; // default
+    next = appendCString(next, units);
+    break;
+  case CRSF_COMMAND:
+    *next++ = commandStep;
+    *next++ = 200; // timeout in 10 ms units, matching upstream
+    next = appendCString(next, commandInfo);
+    break;
+  case CRSF_INFO:
+  case CRSF_STRING:
+    next = appendCString(next, value);
+    break;
+  default:
+    return false;
+  }
+
+  const uint8_t dataSize = (uint8_t)(next - &chunkBuffer[2]);
+  const uint8_t chunkMax = CRSF_MAX_PACKET_LEN - 6 - 2;
+  const uint8_t chunkCnt = (uint8_t)((dataSize + chunkMax - 1) / chunkMax);
+  if (fieldChunk >= chunkCnt) {
+    return false;
+  }
+
+  const uint8_t chunkOffset = (uint8_t)(fieldChunk * chunkMax);
+  const uint8_t chunkSize =
+      (uint8_t)((dataSize - chunkOffset) > chunkMax ? chunkMax
+                                                    : (dataSize - chunkOffset));
+  const uint8_t payloadLen = (uint8_t)(chunkSize + 2);
+  const uint8_t frameSize = CRSF_EXT_FRAME_SIZE(payloadLen);
+
+  uint8_t *payload = frame + sizeof(crsf_ext_header_t);
+  payload[0] = parameterIndex;
+  payload[1] = (uint8_t)(chunkCnt - (fieldChunk + 1));
+  memcpy(payload + 2, &chunkBuffer[2 + chunkOffset], chunkSize);
+
+  setCrsfExtendedHeaderAndCrc(frame, CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY,
+                              frameSize, destAddr,
+                              CRSF_ADDRESS_CRSF_RECEIVER);
+  *frameLen = frameSize + CRSF_FRAME_NOT_COUNTED_BYTES;
+  return true;
+}
+
+static void rxLuaQueueDeviceInfo(crsf_addr_e destAddr) {
+  uint8_t frame[CRSF_FRAME_SIZE_MAX] = {};
+  uint8_t frameLen = 0;
+  if (rxLuaBuildDeviceInfo(destAddr, frame, &frameLen)) {
+    rxLuaQueueFrame(frame, frameLen);
+  }
+}
+
+static void rxLuaQueueParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
+                                uint8_t fieldChunk) {
+  uint8_t frame[CRSF_FRAME_SIZE_MAX] = {};
+  uint8_t frameLen = 0;
+  if (rxLuaBuildParameter(destAddr, parameterIndex, fieldChunk, frame,
+                          &frameLen)) {
+    rxLuaQueueFrame(frame, frameLen);
+  }
+}
+
+static void rxLuaSaveConfig(void) {
+  if (elrs_config_save() != 0) {
+    DBGLN("[RX_LUA] Config save failed");
+  }
+}
+
+static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex,
+                                      uint8_t arg) {
+  elrs_config_t *cfg = elrs_config_get();
+
+  switch (parameterIndex) {
+  case RX_LUA_PARAM_PROTOCOL:
+    if (cfg != nullptr) {
+      cfg->serial_protocol =
+          (arg == 1) ? ELRS_SERIAL_SBUS
+                     : ((arg == 2) ? ELRS_SERIAL_MAVLINK : ELRS_SERIAL_CRSF);
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_FAILSAFE:
+    if (cfg != nullptr) {
+      cfg->failsafe_mode =
+          arg <= ELRS_FAILSAFE_SET ? arg : (uint8_t)ELRS_FAILSAFE_NO_PULSES;
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_FORCE_TLM:
+    if (cfg != nullptr) {
+      cfg->force_tlm = arg ? 1 : 0;
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_WIFI:
+    rxLuaWifiCommandStep = RX_LUA_CMD_EXECUTING;
+    rxLuaWifiCommandInfo = "Entering...";
+    rxLuaWifiPending = (arg == RX_LUA_CMD_CLICK || arg == RX_LUA_CMD_CONFIRMED ||
+                        arg == RX_LUA_CMD_QUERY);
+    rxLuaPendingActionAtMs = millis();
+    rxLuaQueueParameter(origin, parameterIndex, 0);
+    break;
+  case RX_LUA_PARAM_BIND:
+    rxLuaBindCommandStep = RX_LUA_CMD_EXECUTING;
+    rxLuaBindCommandInfo = "Entering...";
+    rxLuaBindPending = (arg == RX_LUA_CMD_CLICK || arg == RX_LUA_CMD_CONFIRMED ||
+                        arg == RX_LUA_CMD_QUERY);
+    rxLuaPendingActionAtMs = millis();
+    rxLuaQueueParameter(origin, parameterIndex, 0);
+    break;
+  default:
+    break;
+  }
+}
+
+static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
+  uint8_t frameLen = 0;
+  if (!validateCrsfFrame(frame, &frameLen)) {
+    return false;
+  }
+
+  const crsf_frame_type_e frameType =
+      (crsf_frame_type_e)frame[CRSF_TELEMETRY_TYPE_INDEX];
+  if (frameType < CRSF_FRAMETYPE_DEVICE_PING) {
+#if ELRS_DIAG_RX_LUA_UL
+    rxLuaDiagIgnore("legacy", frame);
+#endif
+    return false;
+  }
+
+  const auto *ext = reinterpret_cast<const crsf_ext_header_t *>(frame);
+  if (ext->dest_addr != CRSF_ADDRESS_CRSF_RECEIVER &&
+      ext->dest_addr != CRSF_ADDRESS_BROADCAST) {
+#if ELRS_DIAG_RX_LUA_UL
+    rxLuaDiagIgnore("dest", frame);
+#endif
+    return false;
+  }
+
+  const crsf_addr_e origin = ext->orig_addr;
+  const uint8_t *payload = frame + sizeof(crsf_ext_header_t);
+
+  switch (frameType) {
+  case CRSF_FRAMETYPE_DEVICE_PING:
+    rxLuaCrsfHandledCount++;
+    DBGLN("[RX_LUA] DEVICE_PING from 0x%02X", origin);
+    rxLuaQueueDeviceInfo(origin);
+    return true;
+  case CRSF_FRAMETYPE_PARAMETER_READ:
+    rxLuaCrsfHandledCount++;
+    if (frameLen >= sizeof(crsf_ext_header_t) + 2 + CRSF_FRAME_CRC_SIZE) {
+      const uint8_t parameterIndex = payload[0];
+      const uint8_t fieldChunk = payload[1];
+      DBGLN("[RX_LUA] PARAM_READ id=%u chunk=%u from=0x%02X",
+            parameterIndex, fieldChunk, origin);
+      if ((parameterIndex == RX_LUA_PARAM_WIFI) && fieldChunk == 0) {
+        rxLuaWifiCommandStep = RX_LUA_CMD_IDLE;
+        rxLuaWifiCommandInfo = "";
+      } else if ((parameterIndex == RX_LUA_PARAM_BIND) && fieldChunk == 0) {
+        rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
+        rxLuaBindCommandInfo = "";
+      }
+      rxLuaQueueParameter(origin, parameterIndex, fieldChunk);
+    }
+    return true;
+  case CRSF_FRAMETYPE_PARAMETER_WRITE:
+    rxLuaCrsfHandledCount++;
+    if (frameLen >= sizeof(crsf_ext_header_t) + 2 + CRSF_FRAME_CRC_SIZE) {
+      DBGLN("[RX_LUA] PARAM_WRITE id=%u arg=%u", payload[0], payload[1]);
+      rxLuaHandleParameterWrite(origin, payload[0], payload[1]);
+    }
+    return true;
+  default:
+#if ELRS_DIAG_RX_LUA_UL
+    rxLuaDiagIgnore("type", frame);
+#endif
+    return false;
+  }
+}
+
+static void rxLuaProcessPendingActions() {
+  if (!rxLuaWifiPending && !rxLuaBindPending) {
+    return;
+  }
+
+  const uint32_t elapsedMs = millis() - rxLuaPendingActionAtMs;
+  if ((rxLuaQueueCount != 0 || TelemetrySender.IsActive()) && elapsedMs < 5000) {
+    return;
+  }
+
+  if (rxLuaWifiPending) {
+    rxLuaWifiPending = false;
+    rxLuaWifiCommandStep = RX_LUA_CMD_IDLE;
+    rxLuaWifiCommandInfo = "";
+    DBGLN("[RX_LUA] Requesting WiFi mode");
+    elrs_cpp_request_wifi_mode();
+  }
+
+  if (rxLuaBindPending) {
+    rxLuaBindPending = false;
+    rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
+    rxLuaBindCommandInfo = "";
+    DBGLN("[RX_LUA] Entering bind mode");
+    elrs_enter_binding_mode();
+  }
+}
 
 // --- PACKET CAPTURE BUFFER ---
 #define PKT_CAPTURE_SIZE 16
@@ -606,9 +1244,27 @@ ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
     return;
   }
 
+#if ELRS_DIAG_RX_LUA_UL
+  const uint32_t ulChunkCount = ++rxLuaUlChunkCount;
+  rxLuaLastUlPackageIndex = packageIndex;
+  if (rxLuaShouldPrintDiag(ulChunkCount)) {
+    DBGLN("[RX_LUA] UL chunk #%lu pkg=%u len=%u bytes:%02X %02X %02X %02X %02X %02X",
+          (unsigned long)ulChunkCount, packageIndex, dataLen, payload[0],
+          dataLen > 1 ? payload[1] : 0, dataLen > 2 ? payload[2] : 0,
+          dataLen > 3 ? payload[3] : 0, dataLen > 4 ? payload[4] : 0,
+          dataLen > 5 ? payload[5] : 0);
+  }
+#endif
+
   DataUlReceiver.ReceiveData(packageIndex, payload, dataLen);
   if (DataUlReceiver.HasFinishedData()) {
     dataUlReady = true;
+#if ELRS_DIAG_RX_LUA_UL
+    DBGLN("[RX_LUA] UL complete pending after pkg=%u first:%02X %02X %02X %02X %02X %02X %02X %02X",
+          packageIndex, DataUlBuffer[0], DataUlBuffer[1], DataUlBuffer[2],
+          DataUlBuffer[3], DataUlBuffer[4], DataUlBuffer[5], DataUlBuffer[6],
+          DataUlBuffer[7]);
+#endif
   }
 }
 
@@ -981,6 +1637,16 @@ static void updateSwitchMode() {
 }
 
 static void DataUlReceiveComplete() {
+#if ELRS_DIAG_RX_LUA_UL
+  const uint32_t completeCount = ++rxLuaUlCompleteCount;
+  if (rxLuaShouldPrintDiag(completeCount)) {
+    DBGLN("[RX_LUA] UL complete #%lu first:%02X %02X %02X %02X %02X %02X %02X %02X",
+          (unsigned long)completeCount, DataUlBuffer[0], DataUlBuffer[1],
+          DataUlBuffer[2], DataUlBuffer[3], DataUlBuffer[4], DataUlBuffer[5],
+          DataUlBuffer[6], DataUlBuffer[7]);
+  }
+#endif
+
   switch (DataUlBuffer[0]) {
   case MSP_ELRS_SET_RX_WIFI_MODE:
     elrs_cpp_request_wifi_mode();
@@ -1002,6 +1668,10 @@ static void DataUlReceiveComplete() {
     }
     break;
   default:
+    if (rxLuaHandleCrsfFrame(DataUlBuffer)) {
+      break;
+    }
+
     if ((TxOtaProtocol == TX_NORMAL_MODE) && crsf_serial_is_ready()) {
       const crsf_header_t *receivedHeader =
           reinterpret_cast<const crsf_header_t *>(DataUlBuffer);
@@ -1163,6 +1833,22 @@ bool elrs_init(void) {
   // Initialize channel data
   ChannelDataReset();
   memset(DataUlBuffer, 0, sizeof(DataUlBuffer));
+  memset(TelemetryBuffer, 0, sizeof(TelemetryBuffer));
+  rxLuaQueueHead = 0;
+  rxLuaQueueTail = 0;
+  rxLuaQueueCount = 0;
+  rxLuaWifiPending = false;
+  rxLuaBindPending = false;
+  rxLuaWifiCommandStep = RX_LUA_CMD_IDLE;
+  rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
+  rxLuaWifiCommandInfo = "";
+  rxLuaBindCommandInfo = "";
+  rxLuaUlChunkCount = 0;
+  rxLuaUlCompleteCount = 0;
+  rxLuaCrsfHandledCount = 0;
+  rxLuaCrsfRejectCount = 0;
+  rxLuaCrsfIgnoredCount = 0;
+  rxLuaLastUlPackageIndex = 0;
   DataUlReceiver.setMaxPackageIndex(ELRS_MSP_MAX_PACKAGES);
   DataUlReceiver.SetDataToReceive(DataUlBuffer, sizeof(DataUlBuffer));
 
@@ -1300,6 +1986,7 @@ void elrs_loop(void) {
     DBGLN("TIM lat:%lu e2loop:%lu loop2rx:%lu rx2pkt:%lu pkt2cb:%lu "
           "slack:%ld pfdsrc:%u pfdskip:%lu last:%u exp:%u/%u sync:%u/%u "
           "vf:%lu crcN:%d/%u/%u/%lu/%lu tlm:%lu/%lu den:%u "
+          "lua:%lu/%lu/%lu/%lu/%lu/%u/%u "
           "tmr:%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu",
           (unsigned long)lastRxDoneLatencyUs,
           (unsigned long)lastDioToDeferredUs,
@@ -1315,6 +2002,12 @@ void elrs_loop(void) {
           (unsigned long)crcNonceDiagMissCount,
           (unsigned long)telemetryTxCount,
           (unsigned long)telemetrySuppressedCount, ExpressLRS_currTlmDenom,
+          (unsigned long)rxLuaUlChunkCount,
+          (unsigned long)rxLuaUlCompleteCount,
+          (unsigned long)rxLuaCrsfHandledCount,
+          (unsigned long)rxLuaCrsfRejectCount,
+          (unsigned long)rxLuaCrsfIgnoredCount, rxLuaQueueCount,
+          rxLuaLastUlPackageIndex,
           (unsigned long)hwTimer::getHardwareHalfTicks(),
           (unsigned long)hwTimer::getHardwareCount(),
           (unsigned long)hwTimer::getHardwareMatch(),
@@ -1329,6 +2022,7 @@ void elrs_loop(void) {
     DBGLN("TIM lat:%lu e2loop:%lu loop2rx:%lu rx2pkt:%lu pkt2cb:%lu "
           "slack:%ld pfdsrc:%u pfdskip:%lu last:%u exp:%u/%u sync:%u/%u "
           "vf:%lu tlm:%lu/%lu den:%u "
+          "lua:%lu/%lu/%lu/%lu/%lu/%u/%u "
           "tmr:%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu",
           (unsigned long)lastRxDoneLatencyUs,
           (unsigned long)lastDioToDeferredUs,
@@ -1341,6 +2035,12 @@ void elrs_loop(void) {
           lastValidSyncFhss, (unsigned long)lastValidFreq,
           (unsigned long)telemetryTxCount,
           (unsigned long)telemetrySuppressedCount, ExpressLRS_currTlmDenom,
+          (unsigned long)rxLuaUlChunkCount,
+          (unsigned long)rxLuaUlCompleteCount,
+          (unsigned long)rxLuaCrsfHandledCount,
+          (unsigned long)rxLuaCrsfRejectCount,
+          (unsigned long)rxLuaCrsfIgnoredCount, rxLuaQueueCount,
+          rxLuaLastUlPackageIndex,
           (unsigned long)hwTimer::getHardwareHalfTicks(),
           (unsigned long)hwTimer::getHardwareCount(),
           (unsigned long)hwTimer::getHardwareMatch(),
@@ -1367,6 +2067,9 @@ void elrs_loop(void) {
   if (dataUlReady) {
     DataUlReceiveComplete();
   }
+
+  rxLuaPumpTelemetry();
+  rxLuaProcessPendingActions();
 
   updateSwitchMode();
 
