@@ -675,7 +675,7 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     break;
   case RX_LUA_PARAM_TLM_RATIO:
     paramType = CRSF_INFO;
-    name = "Tlm Ratio";
+    name = "Live Tlm";
     value = rxLuaTlmRatioValue;
     break;
   case RX_LUA_PARAM_VERSION:
