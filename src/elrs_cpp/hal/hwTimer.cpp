@@ -280,13 +280,13 @@ void hwTimer::phaseShift(int32_t newPhaseShift) {
 }
 
 void hwTimer::incFreqOffset() {
-  FreqOffset++;
   hw_timer_inc_freq_offset(1);
+  FreqOffset = hw_timer_get_freq_offset();
 }
 
 void hwTimer::decFreqOffset() {
-  FreqOffset--;
   hw_timer_inc_freq_offset(-1);
+  FreqOffset = hw_timer_get_freq_offset();
 }
 
 // Note: handleISR() is not needed - the C timer calls our bridge functions

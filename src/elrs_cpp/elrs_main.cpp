@@ -67,12 +67,18 @@ void elrs_enter_binding_mode(void);
 #define BindingRateChangeCyclePeriodMs 125U
 #define ELRS_DIAG_DISABLE_DOWNLINK_TLM 0
 #define ELRS_DIAG_DISABLE_CRSF_SERIAL 1
-#define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 0
+#define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 1
 #define ELRS_DIAG_CRC_NONCE_WINDOW 0
 #define ELRS_DIAG_RX_LUA_UL 1
 #define ELRS_DIAG_RX_LUA_UL_VERBOSE 0
 #define ELRS_DIAG_RX_LUA_UL_PRINT_LIMIT 24
 #define ELRS_DIAG_RX_LUA_UL_PRINT_EVERY 128
+#define ELRS_PFD_FREQ_LOCK_MAX_US 500
+#define ELRS_PFD_FREQ_LOCK_DX_MAX_US 100
+#define ELRS_PFD_FREQ_LOCK_MIN_LQ 50
+#define ELRS_PFD_PHASE_LOCK_MAX_US 500
+#define ELRS_PFD_PHASE_LOCK_DX_MAX_US 100
+#define ELRS_PFD_PHASE_SHIFT_MAX_US 100
 ///////////////////
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
@@ -156,6 +162,7 @@ uint32_t GotConnectionMillis = 0;
 // Phase lock
 int32_t PfdPrevRawOffset = 0;
 static volatile int32_t pfdLastRawOffset = 0;
+static volatile int32_t pfdLastNormalizedOffset = 0;
 static volatile int32_t pfdLastOffset = 0;
 static volatile int32_t pfdLastOffsetDx = 0;
 static volatile int32_t pfdLastPhaseShift = 0;
@@ -1024,6 +1031,98 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_DataUl(
     OTA_Packet_s const *const otaPktPtr);
 static void DataUlReceiveComplete();
 
+static int32_t normalizePfdOffsetToInterval(int32_t offset) {
+  if (ExpressLRS_currAirRate_Modparams == nullptr ||
+      ExpressLRS_currAirRate_Modparams->interval == 0) {
+    return offset;
+  }
+
+  const int32_t interval =
+      (int32_t)ExpressLRS_currAirRate_Modparams->interval;
+  const int32_t halfInterval = interval / 2;
+
+  // SiW917 defers both radio and timer work into task context. If a packet
+  // callback and timer TOCK cross in the queue, the PFD sample can land one RF
+  // period away. Normalize to the nearest equivalent phase before the LPF so
+  // the correction loop does not integrate toward a false +/-20 ms error.
+  while (offset > halfInterval) {
+    offset -= interval;
+  }
+  while (offset < -halfInterval) {
+    offset += interval;
+  }
+  return offset;
+}
+
+static void trimFreqOffsetTowardZero() {
+  if (hwTimer::FreqOffset > 0) {
+    hwTimer::decFreqOffset();
+  } else if (hwTimer::FreqOffset < 0) {
+    hwTimer::incFreqOffset();
+  }
+}
+
+static int32_t absPfdI32(int32_t value) { return value < 0 ? -value : value; }
+
+static int32_t clampPfdI32(int32_t value, int32_t minValue,
+                           int32_t maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return value;
+}
+
+static bool pfdSampleLooksStable(int32_t offset, int32_t offsetDx,
+                                 int32_t maxOffset, int32_t maxDx) {
+  return absPfdI32(offset) <= maxOffset && absPfdI32(offsetDx) <= maxDx &&
+         LQCalc.getLQRaw() >= ELRS_PFD_FREQ_LOCK_MIN_LQ;
+}
+
+static void updateFreqOffsetFromPfd(int32_t offset, int32_t offsetDx) {
+  if (RXtimerState != tim_locked || (OtaNonce % 8) != 0) {
+    return;
+  }
+
+  // Frequency offset is for tiny steady clock drift. Large phase errors on
+  // SiW917 are usually task/timer ordering or telemetry-slot phase bias, so
+  // feeding them into the integrator walks telemetry slots until the TX drops
+  // downlink. Let phaseShift handle those and bleed stale freq trim back out.
+  if (!pfdSampleLooksStable(offset, offsetDx, ELRS_PFD_FREQ_LOCK_MAX_US,
+                            ELRS_PFD_FREQ_LOCK_DX_MAX_US)) {
+    trimFreqOffsetTowardZero();
+    return;
+  }
+
+  if (offset > 0) {
+    hwTimer::incFreqOffset();
+  } else if (offset < 0) {
+    hwTimer::decFreqOffset();
+  }
+}
+
+static int32_t phaseShiftFromPfd(int32_t rawOffset, int32_t offset,
+                                 int32_t offsetDx) {
+  if (connectionState != connected) {
+    return rawOffset >> 1;
+  }
+
+  // The queued SiW917 task model can occasionally pair the packet timestamp
+  // with the adjacent timer edge. Those samples normalize near +/- half a
+  // packet and are not safe to feed into phase correction. Keep connected-mode
+  // phase nudges small; real crystal drift is handled by the guarded frequency
+  // trim above.
+  if (!pfdSampleLooksStable(offset, offsetDx, ELRS_PFD_PHASE_LOCK_MAX_US,
+                            ELRS_PFD_PHASE_LOCK_DX_MAX_US)) {
+    return 0;
+  }
+
+  return clampPfdI32(offset >> 2, -ELRS_PFD_PHASE_SHIFT_MAX_US,
+                     ELRS_PFD_PHASE_SHIFT_MAX_US);
+}
+
 //=============================================================================
 // Channel data initialization
 //=============================================================================
@@ -1120,28 +1219,20 @@ static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4) {
 static void ICACHE_RAM_ATTR updatePhaseLock() {
   if (connectionState != disconnected && PFDloop.hasResult()) {
     int32_t rawOffset = PFDloop.calcResult();
-    int32_t offset = LPF_Offset.update(rawOffset);
-    int32_t offsetDx = LPF_OffsetDx.update(rawOffset - PfdPrevRawOffset);
-    PfdPrevRawOffset = rawOffset;
+    int32_t normalizedOffset = normalizePfdOffsetToInterval(rawOffset);
+    int32_t offset = LPF_Offset.update(normalizedOffset);
+    int32_t offsetDx =
+        LPF_OffsetDx.update(normalizedOffset - PfdPrevRawOffset);
+    PfdPrevRawOffset = normalizedOffset;
     pfdLastRawOffset = rawOffset;
+    pfdLastNormalizedOffset = normalizedOffset;
     pfdLastOffset = offset;
     pfdLastOffsetDx = offsetDx;
     pfdResultCount++;
 
-    if (RXtimerState == tim_locked && (OtaNonce % 8 == 0)) {
-      if (offset > 0) {
-        hwTimer::incFreqOffset();
-      } else if (offset < 0) {
-        hwTimer::decFreqOffset();
-      }
-    }
+    updateFreqOffsetFromPfd(offset, offsetDx);
 
-    int32_t phaseShift = 0;
-    if (connectionState != connected) {
-      phaseShift = rawOffset >> 1;
-    } else {
-      phaseShift = offset >> 2;
-    }
+    int32_t phaseShift = phaseShiftFromPfd(rawOffset, offset, offsetDx);
     pfdLastPhaseShift = phaseShift;
     hwTimer::phaseShift(phaseShift);
 
@@ -1219,13 +1310,13 @@ static void LostConnection(bool resumeRx) {
     lastDisconnectReason = DISC_EXTERNAL;
   }
 
-  DBGLN("LostConnection reason=%u age=%lu pfd raw=%ld off=%ld dx=%ld phase=%ld "
+  DBGLN("LostConnection reason=%u age=%lu pfd raw=%ld norm=%ld off=%ld dx=%ld phase=%ld "
         "fo=%ld nonce=%u fhss=%u",
         (unsigned)lastDisconnectReason,
         (unsigned long)(millis() - LastValidPacket),
-        (long)pfdLastRawOffset, (long)pfdLastOffset, (long)pfdLastOffsetDx,
-        (long)pfdLastPhaseShift, (long)hwTimer::FreqOffset, OtaNonce,
-        FHSSgetCurrIndex());
+        (long)pfdLastRawOffset, (long)pfdLastNormalizedOffset,
+        (long)pfdLastOffset, (long)pfdLastOffsetDx, (long)pfdLastPhaseShift,
+        (long)hwTimer::FreqOffset, OtaNonce, FHSSgetCurrIndex());
 
   setConnectionState(disconnected);
   RXtimerState = tim_disconnected;
@@ -2107,14 +2198,15 @@ void elrs_loop(void) {
           lastRadioStatusOk, lastRadioStat1, lastRadioStat2, lastRadioIrqByte);
     hwTimer::service();
     DBGLN("LINK conn:%d rxst:%d rate:%d freq:%lu age:%lu nonce:%u fhss:%u "
-          "pfd:%ld/%ld/%ld ph:%ld fo:%ld lq:%u/%u rssi:%d snr:%d disc:%u",
+          "pfd:%ld/%ld/%ld/%ld ph:%ld fo:%ld lq:%u/%u rssi:%d snr:%d disc:%u",
           connectionState, RXtimerState,
           ExpressLRS_currAirRate_Modparams
               ? ExpressLRS_currAirRate_Modparams->index
               : 0,
           Radio.currFreq, (unsigned long)(now - LastValidPacket), OtaNonce,
           FHSSgetCurrIndex(),
-          (long)pfdLastRawOffset, (long)pfdLastOffset,
+          (long)pfdLastRawOffset, (long)pfdLastNormalizedOffset,
+          (long)pfdLastOffset,
           (long)pfdLastOffsetDx, (long)pfdLastPhaseShift,
           (long)hwTimer::FreqOffset, LQCalc.getLQRaw(), LQCalc.getCount(),
           Radio.LastPacketRSSI, Radio.LastPacketSNRRaw,
